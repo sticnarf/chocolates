@@ -1,8 +1,8 @@
-use super::{PoolContext, SpawnHandle};
+use super::PoolContext;
 
 pub enum Task {
-    Once(Box<dyn FnOnce(&mut SchedulerRef<'_>) + Send>),
-    Mut(Box<dyn FnMut(&mut SchedulerRef<'_>) + Send>),
+    Once(Box<dyn FnOnce(&mut Handle<'_>) + Send>),
+    Mut(Box<dyn FnMut(&mut Handle<'_>) + Send>),
 }
 
 pub struct Runner {
@@ -13,17 +13,17 @@ impl super::Runner for Runner {
     type Task = Task;
 
     fn handle(&mut self, ctx: &mut PoolContext<Task>, mut task: Task) {
-        let mut sched_ref = SchedulerRef { ctx, rerun: false };
+        let mut handle = Handle { ctx, rerun: false };
         match task {
             Task::Mut(ref mut r) => {
                 let mut tried_times = 0;
                 loop {
-                    r(&mut sched_ref);
-                    if !sched_ref.rerun {
+                    r(&mut handle);
+                    if !handle.rerun {
                         return;
                     }
                     // TODO: fix the bug here when set to true.
-                    sched_ref.rerun = false;
+                    handle.rerun = false;
                     tried_times += 1;
                     if tried_times == self.max_inplace_spin {
                         break;
@@ -31,7 +31,7 @@ impl super::Runner for Runner {
                 }
             }
             Task::Once(r) => {
-                r(&mut sched_ref);
+                r(&mut handle);
                 return;
             }
         }
@@ -39,17 +39,17 @@ impl super::Runner for Runner {
     }
 }
 
-pub struct SchedulerRef<'a> {
+pub struct Handle<'a> {
     ctx: &'a mut PoolContext<Task>,
     rerun: bool,
 }
 
-impl<'a> SchedulerRef<'a> {
-    pub fn spawn_once(&mut self, t: impl FnOnce(&mut SchedulerRef<'_>) + Send + 'static) {
+impl<'a> Handle<'a> {
+    pub fn spawn_once(&mut self, t: impl FnOnce(&mut Handle<'_>) + Send + 'static) {
         self.ctx.spawn(Task::Once(Box::new(t)));
     }
 
-    pub fn spawn_mut(&mut self, t: impl FnMut(&mut SchedulerRef<'_>) + Send + 'static) {
+    pub fn spawn_mut(&mut self, t: impl FnMut(&mut Handle<'_>) + Send + 'static) {
         self.ctx.spawn(Task::Mut(Box::new(t)));
     }
 
@@ -57,24 +57,24 @@ impl<'a> SchedulerRef<'a> {
         self.rerun = true;
     }
 
-    pub fn to_owned(&self) -> Scheduler {
-        Scheduler {
-            handle: self.ctx.spawn_handle(),
+    pub fn to_owned(&self) -> Remote {
+        Remote {
+            remote: self.ctx.remote(),
         }
     }
 }
 
-pub struct Scheduler {
-    handle: SpawnHandle<Task>,
+pub struct Remote {
+    remote: super::Remote<Task>,
 }
 
-impl Scheduler {
-    pub fn spawn_once(&self, t: impl FnOnce(&mut SchedulerRef<'_>) + Send + 'static) {
-        self.handle.spawn(Task::Once(Box::new(t)));
+impl Remote {
+    pub fn spawn_once(&self, t: impl FnOnce(&mut Handle<'_>) + Send + 'static) {
+        self.remote.spawn(Task::Once(Box::new(t)));
     }
 
-    pub fn spawn_mut(&self, t: impl FnMut(&mut SchedulerRef<'_>) + Send + 'static) {
-        self.handle.spawn(Task::Mut(Box::new(t)))
+    pub fn spawn_mut(&self, t: impl FnMut(&mut Handle<'_>) + Send + 'static) {
+        self.remote.spawn(Task::Mut(Box::new(t)))
     }
 }
 
@@ -105,11 +105,11 @@ impl super::RunnerFactory for RunnerFactory {
 }
 
 impl super::ThreadPool<Task> {
-    pub fn spawn_once(&self, t: impl FnOnce(&mut SchedulerRef<'_>) + Send + 'static) {
+    pub fn spawn_once(&self, t: impl FnOnce(&mut Handle<'_>) + Send + 'static) {
         self.spawn(Task::Once(Box::new(t)));
     }
 
-    pub fn spawn_mut(&self, t: impl FnMut(&mut SchedulerRef<'_>) + Send + 'static) {
+    pub fn spawn_mut(&self, t: impl FnMut(&mut Handle<'_>) + Send + 'static) {
         self.spawn(Task::Mut(Box::new(t)))
     }
 }

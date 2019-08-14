@@ -53,8 +53,8 @@ impl<Task> PoolContext<Task> {
         self.local_queue.local.push(SchedUnit::new(t.into()));
     }
 
-    pub fn spawn_handle(&self) -> SpawnHandle<Task> {
-        SpawnHandle {
+    pub fn remote(&self) -> Remote<Task> {
+        Remote {
             queue: Queues {
                 core: self.local_queue.core.clone(),
             },
@@ -172,19 +172,19 @@ impl<Task> PoolContext<Task> {
     }
 }
 
-pub struct SpawnHandle<Task> {
+pub struct Remote<Task> {
     queue: Queues<Task>,
 }
 
-impl<Task> Clone for SpawnHandle<Task> {
-    fn clone(&self) -> SpawnHandle<Task> {
-        SpawnHandle {
+impl<Task> Clone for Remote<Task> {
+    fn clone(&self) -> Remote<Task> {
+        Remote {
             queue: self.queue.clone(),
         }
     }
 }
 
-impl<Task> SpawnHandle<Task> {
+impl<Task> Remote<Task> {
     pub fn spawn(&self, t: impl Into<Task>) {
         self.queue.push(t.into());
     }
@@ -408,6 +408,7 @@ struct SchedConfig {
 
 pub struct Config {
     name_prefix: String,
+    stack_size: Option<usize>,
     sched_config: SchedConfig,
 }
 
@@ -415,6 +416,7 @@ impl Config {
     pub fn new(name_prefix: impl Into<String>) -> Config {
         Config {
             name_prefix: name_prefix.into(),
+            stack_size: None,
             sched_config: SchedConfig {
                 max_thread_count: num_cpus::get(),
                 min_thread_count: 1,
@@ -460,6 +462,13 @@ impl Config {
         self
     }
 
+    pub fn stack_size(&mut self, size: usize) -> &mut Config {
+        if size > 0 {
+            self.stack_size = Some(size);
+        }
+        self
+    }
+
     pub fn spawn<F>(
         &self,
         mut factory: F,
@@ -491,14 +500,11 @@ impl Config {
             let local_queue = queues.acquire_local_queue();
             let th = WorkerThread::new(local_queue, r, self.sched_config.clone());
             let pause = i >= self.sched_config.min_thread_count;
-            threads.push(
-                Builder::new()
-                    .name(format!("{}-{}", self.name_prefix, i))
-                    .spawn(move || {
-                        th.run(pause);
-                    })
-                    .unwrap(),
-            );
+            let mut builder = Builder::new().name(format!("{}-{}", self.name_prefix, i));
+            if let Some(size) = self.stack_size {
+                builder = builder.stack_size(size)
+            }
+            threads.push(builder.spawn(move || th.run(pause)).unwrap());
         }
         ThreadPool {
             queues,
@@ -517,8 +523,8 @@ impl<Task> ThreadPool<Task> {
         self.queues.push(t.into());
     }
 
-    pub fn spawn_handle(&self) -> SpawnHandle<Task> {
-        SpawnHandle {
+    pub fn remote(&self) -> Remote<Task> {
+        Remote {
             queue: self.queues.clone(),
         }
     }

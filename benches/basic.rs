@@ -155,7 +155,7 @@ mod cpupool {
 }
 
 mod thread_pool_callback {
-    use chocolates::thread_pool::callback::{RunnerFactory, SchedulerRef};
+    use chocolates::thread_pool::callback::{Handle, RunnerFactory};
     use chocolates::thread_pool::Config;
     use num_cpus;
     use std::sync::atomic::AtomicUsize;
@@ -197,7 +197,7 @@ mod thread_pool_callback {
                 let mut rem = super::NUM_YIELD;
                 let tx = tx.clone();
 
-                fn sub_rem(c: &mut SchedulerRef<'_>, rem: &mut usize, tx: &mpsc::SyncSender<()>) {
+                fn sub_rem(c: &mut Handle<'_>, rem: &mut usize, tx: &mpsc::SyncSender<()>) {
                     *rem -= 1;
                     if *rem == 0 {
                         tx.send(()).unwrap();

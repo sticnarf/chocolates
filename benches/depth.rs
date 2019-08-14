@@ -70,7 +70,7 @@ mod cpupool {
 }
 
 mod thread_pool_callback {
-    use chocolates::thread_pool::callback::{RunnerFactory, SchedulerRef};
+    use chocolates::thread_pool::callback::{Handle, RunnerFactory};
     use chocolates::thread_pool::Config;
     use criterion::Bencher;
     use std::sync::mpsc;
@@ -78,7 +78,7 @@ mod thread_pool_callback {
     pub fn chained_spawn(b: &mut Bencher) {
         let pool = Config::new("chain-spawn").spawn(RunnerFactory::new());
 
-        fn spawn(c: &mut SchedulerRef<'_>, res_tx: mpsc::Sender<()>, n: usize) {
+        fn spawn(c: &mut Handle<'_>, res_tx: mpsc::Sender<()>, n: usize) {
             if n == 0 {
                 res_tx.send(()).unwrap();
             } else {
@@ -97,7 +97,7 @@ mod thread_pool_callback {
 }
 
 mod thread_pool_future {
-    use chocolates::thread_pool::future::{FutureSpawnHandle, RunnerFactory};
+    use chocolates::thread_pool::future::{RunnerFactory, Sender};
     use chocolates::thread_pool::Config;
     use criterion::Bencher;
     use futures::future;
@@ -108,7 +108,7 @@ mod thread_pool_future {
             .max_idle_time(std::time::Duration::from_secs(3))
             .spawn(RunnerFactory::new(4));
 
-        fn spawn(pool_tx: FutureSpawnHandle, res_tx: mpsc::Sender<()>, n: usize) {
+        fn spawn(pool_tx: Sender, res_tx: mpsc::Sender<()>, n: usize) {
             if n == 0 {
                 res_tx.send(()).unwrap();
             } else {
@@ -123,11 +123,7 @@ mod thread_pool_future {
         b.iter(move || {
             let (res_tx, res_rx) = mpsc::channel();
 
-            spawn(
-                threadpool.future_spawn_handle().clone(),
-                res_tx,
-                super::ITER,
-            );
+            spawn(threadpool.sender(), res_tx, super::ITER);
             res_rx.recv().unwrap();
         });
     }

@@ -1,5 +1,6 @@
-use super::{PoolContext, SpawnHandle};
+use super::PoolContext;
 use futures::executor::{self, Notify, Spawn};
+use futures::future::{ExecuteError, Executor};
 use futures::{Async, Future};
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -37,11 +38,11 @@ thread_local! {
 }
 
 #[derive(Clone)]
-pub struct FutureSpawnHandle {
-    handle: SpawnHandle<Arc<TaskUnit>>,
+pub struct Sender {
+    remote: super::Remote<Arc<TaskUnit>>,
 }
 
-impl FutureSpawnHandle {
+impl Sender {
     pub fn spawn(&self, f: impl Future<Item = (), Error = ()> + Send + 'static) {
         self.spawn_task(Arc::new(TaskUnit::new(f)))
     }
@@ -50,7 +51,7 @@ impl FutureSpawnHandle {
         LOCAL_WAKER.with(|w| {
             let ptr = unsafe { *w.get() };
             if ptr.is_null() {
-                self.handle.spawn(task)
+                self.remote.spawn(task)
             } else {
                 unsafe { &mut *ptr }.spawn(task)
             }
@@ -59,7 +60,7 @@ impl FutureSpawnHandle {
 }
 
 pub struct ThreadPoolNotify {
-    handle: FutureSpawnHandle,
+    sender: Sender,
 }
 
 impl Notify for ThreadPoolNotify {
@@ -71,7 +72,7 @@ impl Notify for ThreadPoolNotify {
         }
         let t = task.clone();
         mem::forget(task);
-        self.handle.spawn_task(t);
+        self.sender.spawn_task(t);
     }
 
     fn clone_id(&self, id: usize) -> usize {
@@ -114,9 +115,9 @@ impl FutureThreadPool {
         self.spawn(t);
     }
 
-    pub fn future_spawn_handle(&self) -> FutureSpawnHandle {
-        FutureSpawnHandle {
-            handle: self.spawn_handle(),
+    pub fn sender(&self) -> Sender {
+        Sender {
+            remote: self.remote(),
         }
     }
 }
@@ -181,8 +182,8 @@ impl super::Runner for Runner {
             *waker = ctx;
         });
         self.notifier = Some(Arc::new(ThreadPoolNotify {
-            handle: FutureSpawnHandle {
-                handle: ctx.spawn_handle(),
+            sender: Sender {
+                remote: ctx.remote(),
             },
         }));
     }
@@ -223,5 +224,27 @@ impl super::Runner for Runner {
             *waker = ptr::null_mut();
         });
         self.notifier.take();
+    }
+}
+
+impl<F> Executor<F> for Sender
+where
+    F: Future<Item = (), Error = ()> + Send + 'static,
+{
+    fn execute(&self, future: F) -> Result<(), ExecuteError<F>> {
+        self.spawn(future);
+        // TODO: handle shutdown here.
+        Ok(())
+    }
+}
+
+impl<F> Executor<F> for FutureThreadPool
+where
+    F: Future<Item = (), Error = ()> + Send + 'static,
+{
+    fn execute(&self, future: F) -> Result<(), ExecuteError<F>> {
+        self.spawn_future(future);
+        // TODO: handle shutdown here.
+        Ok(())
     }
 }
