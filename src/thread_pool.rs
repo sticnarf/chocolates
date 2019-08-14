@@ -194,7 +194,7 @@ pub trait Runner {
     type Task;
 
     fn start(&mut self, _ctx: &mut PoolContext<Self::Task>) {}
-    fn handle(&mut self, ctx: &mut PoolContext<Self::Task>, task: Self::Task);
+    fn handle(&mut self, ctx: &mut PoolContext<Self::Task>, task: Self::Task, fetch_time: Instant);
     fn pause(&mut self, _ctx: &PoolContext<Self::Task>) {}
     fn resume(&mut self, _ctx: &PoolContext<Self::Task>) {}
     fn end(&mut self, _ctx: &PoolContext<Self::Task>) {}
@@ -389,7 +389,7 @@ impl<R: Runner> WorkerThread<R> {
                 ctx.local_queue.unpark_one();
                 last_spawn_time = now;
             }
-            self.runner.handle(&mut ctx, t.task);
+            self.runner.handle(&mut ctx, t.task, now);
         }
         // ctx.dump_metrics();
         self.runner.end(&ctx);

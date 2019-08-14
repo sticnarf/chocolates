@@ -1,4 +1,5 @@
 use super::PoolContext;
+use std::time::Instant;
 
 pub enum Task {
     Once(Box<dyn FnOnce(&mut Handle<'_>) + Send>),
@@ -12,7 +13,7 @@ pub struct Runner {
 impl super::Runner for Runner {
     type Task = Task;
 
-    fn handle(&mut self, ctx: &mut PoolContext<Task>, mut task: Task) {
+    fn handle(&mut self, ctx: &mut PoolContext<Task>, mut task: Task, _: Instant) {
         let mut handle = Handle { ctx, rerun: false };
         match task {
             Task::Mut(ref mut r) => {

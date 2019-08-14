@@ -1,11 +1,15 @@
 use super::PoolContext;
 use futures::executor::{self, Notify, Spawn};
 use futures::future::{ExecuteError, Executor};
+use futures::sync::oneshot;
 use futures::{Async, Future};
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use std::{mem, ptr};
+
+pub use futures::sync::oneshot::SpawnHandle;
 
 pub struct Runner {
     max_inplace_spin: usize,
@@ -19,6 +23,14 @@ pub struct RunnerFactory {
 impl RunnerFactory {
     pub fn new(max_inplace_spin: usize) -> RunnerFactory {
         RunnerFactory { max_inplace_spin }
+    }
+}
+
+impl Default for RunnerFactory {
+    fn default() -> RunnerFactory {
+        RunnerFactory {
+            max_inplace_spin: 4,
+        }
     }
 }
 
@@ -45,6 +57,15 @@ pub struct Sender {
 impl Sender {
     pub fn spawn(&self, f: impl Future<Item = (), Error = ()> + Send + 'static) {
         self.spawn_task(Arc::new(TaskUnit::new(f)))
+    }
+
+    pub fn spawn_handle<F>(&self, f: F) -> SpawnHandle<F::Item, F::Error>
+    where
+        F: Future + Send + 'static,
+        F::Item: Send,
+        F::Error: Send,
+    {
+        oneshot::spawn(f, self)
     }
 
     fn spawn_task(&self, task: Arc<TaskUnit>) {
@@ -113,6 +134,15 @@ impl FutureThreadPool {
     pub fn spawn_future<F: Future<Item = (), Error = ()> + Send + 'static>(&self, f: F) {
         let t = Arc::new(TaskUnit::new(f));
         self.spawn(t);
+    }
+
+    pub fn spawn_future_handle<F>(&self, f: F) -> SpawnHandle<F::Item, F::Error>
+    where
+        F: Future + Send + 'static,
+        F::Item: Send,
+        F::Error: Send,
+    {
+        oneshot::spawn(f, self)
     }
 
     pub fn sender(&self) -> Sender {
@@ -188,7 +218,7 @@ impl super::Runner for Runner {
         }));
     }
 
-    fn handle(&mut self, ctx: &mut PoolContext<Self::Task>, task: Self::Task) {
+    fn handle(&mut self, ctx: &mut PoolContext<Self::Task>, task: Self::Task, _: Instant) {
         let mut tried_times = 1;
         let id = &*task as *const TaskUnit as usize;
         let spawn = unsafe { &mut *task.task.get() }.as_mut().unwrap();
