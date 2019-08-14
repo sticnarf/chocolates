@@ -105,38 +105,25 @@ impl<Task> PoolContext<Task> {
         }
     }
 
-    fn park(
-        &mut self,
-        timeout: Option<Duration>,
-        skip_check: bool,
-    ) -> (Steal<SchedUnit<Task>>, bool) {
+    fn park(&mut self, timeout: Option<Duration>) -> (Steal<SchedUnit<Task>>, bool) {
         let address = &*self.local_queue.core as *const QueueCore<Task> as usize;
         let timeout = timeout.map(|t| Instant::now() + t);
         let token = ParkToken(self.local_queue.pos);
         let mut task = (Steal::Empty, false);
-        let (pos, s_l, h_l) = (self.local_queue.pos, self.spawn_local, self.handled_local);
         let res = unsafe {
             parking_lot_core::park(
                 address,
                 || {
-                    if !skip_check {
-                        self.local_queue.core.sleep();
-                    }
+                    self.local_queue.core.sleep();
                     let should_shutdown = self.local_queue.core.should_shutdown();
                     if should_shutdown {
                         false
-                    } else if skip_check {
-                        true
                     } else {
                         task = self.deque_a_task();
                         task.0.is_empty()
                     }
                 },
-                || {
-                    assert!(pos < 10);
-                    assert!(s_l < 1024000000);
-                    assert!(h_l < 1024000000);
-                },
+                || {},
                 |_, _| (),
                 token,
                 timeout,
@@ -210,6 +197,7 @@ struct QueueCore<Task> {
     global: crossbeam_deque::Injector<SchedUnit<Task>>,
     stealers: Vec<crossbeam_deque::Stealer<SchedUnit<Task>>>,
     running_count: AtomicUsize,
+    min_thread_count: usize,
     locals: Mutex<Vec<Option<crossbeam_deque::Worker<SchedUnit<Task>>>>>,
 }
 
@@ -290,17 +278,19 @@ impl<Task> Queues<Task> {
 
     fn unpark_one(&self) -> bool {
         let cnt = self.core.running_count.load(Ordering::SeqCst);
-        if cnt ^ SHUTDOWN_MARK > SHUTDOWN_MARK {
+        if cnt ^ SHUTDOWN_MARK >= SHUTDOWN_MARK + self.core.min_thread_count {
             return false;
         }
 
         let address = &*self.core as *const QueueCore<Task> as usize;
         let token = UnparkToken(self.core.stealers.len());
+        let mut parked = false;
         let res = unsafe {
             parking_lot_core::unpark_filter(
                 address,
                 |ParkToken(id)| {
-                    if id == 0 || cnt >= SHUTDOWN_MARK {
+                    if !parked && (id < self.core.min_thread_count || cnt >= SHUTDOWN_MARK) {
+                        parked = true;
                         FilterOp::Unpark
                     } else {
                         FilterOp::Skip
@@ -341,14 +331,10 @@ impl<R: Runner> WorkerThread<R> {
         }
     }
 
-    fn run(mut self, pause: bool) {
+    fn run(mut self) {
         let mut ctx = PoolContext::new(self.local);
-        if pause {
-            let _ = ctx.park(self.sched_config.max_idle_time, true);
-        } else {
-            ctx.local_queue.core.wake_up();
-        }
         let mut last_spawn_time = Instant::now();
+        ctx.local_queue.core.wake_up();
         self.runner.start(&mut ctx);
         'out: while !ctx.local_queue.core.should_shutdown() {
             let (t, is_local) = match ctx.deque_a_task() {
@@ -363,7 +349,7 @@ impl<R: Runner> WorkerThread<R> {
                         }
                         if tried_times > self.sched_config.max_inplace_spin {
                             self.runner.pause(&ctx);
-                            match ctx.park(self.sched_config.max_idle_time, false) {
+                            match ctx.park(self.sched_config.max_idle_time) {
                                 (Steal::Retry, _) => {
                                     self.runner.resume(&ctx);
                                     continue 'out;
@@ -492,6 +478,7 @@ impl Config {
                 stealers,
                 locals: Mutex::new(workers),
                 running_count: AtomicUsize::new(0),
+                min_thread_count: self.sched_config.min_thread_count,
             }),
         };
         let mut threads = Vec::with_capacity(self.sched_config.max_thread_count);
@@ -499,12 +486,11 @@ impl Config {
             let r = factory.produce();
             let local_queue = queues.acquire_local_queue();
             let th = WorkerThread::new(local_queue, r, self.sched_config.clone());
-            let pause = i >= self.sched_config.min_thread_count;
             let mut builder = Builder::new().name(format!("{}-{}", self.name_prefix, i));
             if let Some(size) = self.stack_size {
                 builder = builder.stack_size(size)
             }
-            threads.push(builder.spawn(move || th.run(pause)).unwrap());
+            threads.push(builder.spawn(move || th.run()).unwrap());
         }
         ThreadPool {
             queues,
