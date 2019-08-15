@@ -6,7 +6,6 @@ use futures::{Async, Future};
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 use std::{mem, ptr};
 
 pub use futures::sync::oneshot::SpawnHandle;
@@ -218,7 +217,7 @@ impl super::Runner for Runner {
         }));
     }
 
-    fn handle(&mut self, ctx: &mut PoolContext<Self::Task>, task: Self::Task, _: Instant) {
+    fn handle(&mut self, ctx: &mut PoolContext<Self::Task>, task: Self::Task) -> bool {
         let mut tried_times = 1;
         let id = &*task as *const TaskUnit as usize;
         let spawn = unsafe { &mut *task.task.get() }.as_mut().unwrap();
@@ -229,11 +228,11 @@ impl super::Runner for Runner {
             match res {
                 Ok(Async::NotReady) => {
                     if task.mark_idle() {
-                        break;
+                        return false;
                     } else {
                         if tried_times >= self.max_inplace_spin {
                             ctx.spawn(task);
-                            break;
+                            return false;
                         } else {
                             tried_times += 1;
                         }
@@ -241,7 +240,7 @@ impl super::Runner for Runner {
                 }
                 Ok(Async::Ready(())) | Err(()) => {
                     task.on_completed();
-                    break;
+                    return true;
                 }
             }
         }

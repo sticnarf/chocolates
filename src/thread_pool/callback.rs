@@ -1,5 +1,4 @@
 use super::PoolContext;
-use std::time::Instant;
 
 pub enum Task {
     Once(Box<dyn FnOnce(&mut Handle<'_>) + Send>),
@@ -13,7 +12,7 @@ pub struct Runner {
 impl super::Runner for Runner {
     type Task = Task;
 
-    fn handle(&mut self, ctx: &mut PoolContext<Task>, mut task: Task, _: Instant) {
+    fn handle(&mut self, ctx: &mut PoolContext<Task>, mut task: Task) -> bool {
         let mut handle = Handle { ctx, rerun: false };
         match task {
             Task::Mut(ref mut r) => {
@@ -21,7 +20,7 @@ impl super::Runner for Runner {
                 loop {
                     r(&mut handle);
                     if !handle.rerun {
-                        return;
+                        return true;
                     }
                     // TODO: fix the bug here when set to true.
                     handle.rerun = false;
@@ -33,10 +32,11 @@ impl super::Runner for Runner {
             }
             Task::Once(r) => {
                 r(&mut handle);
-                return;
+                return true;
             }
         }
         ctx.spawn(task);
+        false
     }
 }
 

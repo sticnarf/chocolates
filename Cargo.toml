@@ -35,4 +35,4 @@ harness = false
 
 [profile.bench]
 debug = true
-codegen-unit = 1
+codegen-units = 1
