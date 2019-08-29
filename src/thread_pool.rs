@@ -182,7 +182,7 @@ pub trait Runner {
 
     fn start(&mut self, _ctx: &mut PoolContext<Self::Task>) {}
     fn handle(&mut self, ctx: &mut PoolContext<Self::Task>, task: Self::Task) -> bool;
-    fn pause(&mut self, _ctx: &PoolContext<Self::Task>) {}
+    fn pause(&mut self, _ctx: &PoolContext<Self::Task>) -> bool { true }
     fn resume(&mut self, _ctx: &PoolContext<Self::Task>) {}
     fn end(&mut self, _ctx: &PoolContext<Self::Task>) {}
 }
@@ -348,7 +348,9 @@ impl<R: Runner> WorkerThread<R> {
                             (Steal::Retry, _) => continue 'out,
                         }
                         if tried_times > self.sched_config.max_inplace_spin {
-                            self.runner.pause(&ctx);
+                            if !self.runner.pause(&ctx) {
+                                continue;
+                            }
                             match ctx.park(self.sched_config.max_idle_time) {
                                 (Steal::Retry, _) => {
                                     self.runner.resume(&ctx);
