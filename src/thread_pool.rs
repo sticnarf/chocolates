@@ -182,7 +182,9 @@ pub trait Runner {
 
     fn start(&mut self, _ctx: &mut PoolContext<Self::Task>) {}
     fn handle(&mut self, ctx: &mut PoolContext<Self::Task>, task: Self::Task) -> bool;
-    fn pause(&mut self, _ctx: &PoolContext<Self::Task>) -> bool { true }
+    fn pause(&mut self, _ctx: &PoolContext<Self::Task>) -> bool {
+        true
+    }
     fn resume(&mut self, _ctx: &PoolContext<Self::Task>) {}
     fn end(&mut self, _ctx: &PoolContext<Self::Task>) {}
 }
@@ -394,6 +396,41 @@ struct SchedConfig {
     local_spawn_backoff: Duration,
 }
 
+pub struct LazyConfig<T> {
+    cfg: Config,
+    queues: Queues<T>,
+}
+
+impl<T: Send> LazyConfig<T> {
+    pub fn name(mut self, name_prefix: impl Into<String>) -> LazyConfig<T> {
+        self.cfg.name_prefix = name_prefix.into();
+        self
+    }
+
+    pub fn spawn<F>(self, mut factory: F) -> ThreadPool<T>
+    where
+        F: RunnerFactory,
+        F::Runner: Runner<Task = T> + Send + 'static,
+    {
+        let mut threads = Vec::with_capacity(self.cfg.sched_config.max_thread_count);
+        for i in 0..self.cfg.sched_config.max_thread_count {
+            let r = factory.produce();
+            let local_queue = self.queues.acquire_local_queue();
+            let th = WorkerThread::new(local_queue, r, self.cfg.sched_config.clone());
+            let mut builder = Builder::new().name(format!("{}-{}", self.cfg.name_prefix, i));
+            if let Some(size) = self.cfg.stack_size {
+                builder = builder.stack_size(size)
+            }
+            threads.push(builder.spawn(move || th.run()).unwrap());
+        }
+        ThreadPool {
+            queues: self.queues,
+            threads: Mutex::new(threads),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct Config {
     name_prefix: String,
     stack_size: Option<usize>,
@@ -457,15 +494,7 @@ impl Config {
         self
     }
 
-    pub fn spawn<F>(
-        &self,
-        mut factory: F,
-    ) -> ThreadPool<<<F as RunnerFactory>::Runner as Runner>::Task>
-    where
-        F: RunnerFactory,
-        F::Runner: Send + 'static,
-        <<F as RunnerFactory>::Runner as Runner>::Task: Send,
-    {
+    pub fn freeze<T>(&self) -> (Remote<T>, LazyConfig<T>) {
         let injector = crossbeam_deque::Injector::new();
         let mut workers = Vec::with_capacity(self.sched_config.max_thread_count);
         let mut stealers = Vec::with_capacity(self.sched_config.max_thread_count);
@@ -483,21 +512,24 @@ impl Config {
                 min_thread_count: self.sched_config.min_thread_count,
             }),
         };
-        let mut threads = Vec::with_capacity(self.sched_config.max_thread_count);
-        for i in 0..self.sched_config.max_thread_count {
-            let r = factory.produce();
-            let local_queue = queues.acquire_local_queue();
-            let th = WorkerThread::new(local_queue, r, self.sched_config.clone());
-            let mut builder = Builder::new().name(format!("{}-{}", self.name_prefix, i));
-            if let Some(size) = self.stack_size {
-                builder = builder.stack_size(size)
-            }
-            threads.push(builder.spawn(move || th.run()).unwrap());
-        }
-        ThreadPool {
-            queues,
-            threads: Mutex::new(threads),
-        }
+        (
+            Remote {
+                queue: queues.clone(),
+            },
+            LazyConfig {
+                cfg: self.clone(),
+                queues,
+            },
+        )
+    }
+
+    pub fn spawn<F>(&self, factory: F) -> ThreadPool<<<F as RunnerFactory>::Runner as Runner>::Task>
+    where
+        F: RunnerFactory,
+        F::Runner: Send + 'static,
+        <<F as RunnerFactory>::Runner as Runner>::Task: Send,
+    {
+        self.freeze().1.spawn(factory)
     }
 }
 
