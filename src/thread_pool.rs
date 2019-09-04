@@ -3,13 +3,37 @@ pub mod future;
 
 use crossbeam_deque::Steal;
 use parking_lot_core::{FilterOp, ParkResult, ParkToken, UnparkToken};
-use std::mem;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{Builder, JoinHandle};
 use std::time::{Duration, Instant};
+use std::{mem, usize};
 
-const SHUTDOWN_MARK: usize = 0x800000000;
+const SHUTDOWN_BIT: usize = 0x01;
+const RUNNING_BASE_SHIFT: usize = 1;
+const RUNNING_BASE: usize = 1 << RUNNING_BASE_SHIFT;
+const SLOTS_BASE_SHIFT: usize = 16;
+const SLOTS_BASE: usize = 1 << SLOTS_BASE_SHIFT;
+
+#[inline]
+const fn slot_count(info: usize) -> usize {
+    info >> SLOTS_BASE_SHIFT
+}
+
+#[inline]
+const fn running_count(info: usize) -> usize {
+    (info & (SLOTS_BASE - 1)) >> RUNNING_BASE_SHIFT
+}
+
+#[inline]
+const fn is_slot_full(info: usize) -> bool {
+    running_count(info) == slot_count(info)
+}
+
+#[inline]
+const fn is_shutdown(info: usize) -> bool {
+    info & SHUTDOWN_BIT == SHUTDOWN_BIT
+}
 
 struct SchedUnit<Task> {
     task: Task,
@@ -25,26 +49,62 @@ impl<Task> SchedUnit<Task> {
     }
 }
 
-pub struct PoolContext<Task> {
-    local_queue: LocalQueue<Task>,
+#[derive(Clone, Default, Debug)]
+struct HandleMetrics {
     handled_global: usize,
     handled_miss: usize,
     handled_local: usize,
     handled_steal: usize,
-    spawn_local: usize,
+    handled_retry: usize,
+}
+
+impl HandleMetrics {
+    fn miss(&self) -> usize {
+        self.handled_miss
+    }
+
+    fn hit(&self) -> usize {
+        self.handled_global + self.handled_local + self.handled_steal
+    }
+}
+
+#[derive(Debug)]
+struct ParkMetrics {
+    desc_slots: usize,
+    incr_slots: usize,
     park_cnt: Vec<usize>,
+    unpark_times: usize,
+}
+
+impl ParkMetrics {
+    fn new(cap: usize) -> ParkMetrics {
+        ParkMetrics {
+            desc_slots: 0,
+            incr_slots: 0,
+            park_cnt: vec![0; cap],
+            unpark_times: 0,
+        }
+    }
+}
+
+pub struct PoolContext<Task> {
+    local_queue: LocalQueue<Task>,
+    metrics: HandleMetrics,
+    park_metrics: ParkMetrics,
+    agent: SlotAgent,
+    spawn_local: usize,
+    metrics_snap: HandleMetrics,
 }
 
 impl<Task> PoolContext<Task> {
-    fn new(queue: LocalQueue<Task>) -> PoolContext<Task> {
+    fn new(queue: LocalQueue<Task>, agent: SlotAgent) -> PoolContext<Task> {
         PoolContext {
-            handled_global: 0,
-            handled_miss: 0,
-            handled_steal: 0,
-            handled_local: 0,
+            metrics: HandleMetrics::default(),
             spawn_local: 0,
-            park_cnt: vec![0; queue.core.stealers.len() + 1],
+            agent,
+            park_metrics: ParkMetrics::new(queue.core.stealers.len() + 1),
             local_queue: queue,
+            metrics_snap: HandleMetrics::default(),
         }
     }
 
@@ -64,7 +124,7 @@ impl<Task> PoolContext<Task> {
     #[inline]
     fn deque_a_task(&mut self) -> (Steal<SchedUnit<Task>>, bool) {
         if let Some(e) = self.local_queue.local.pop() {
-            self.handled_local += 1;
+            self.metrics.handled_local += 1;
             return (Steal::Success(e), true);
         }
         self.deque_global_task()
@@ -79,7 +139,7 @@ impl<Task> PoolContext<Task> {
             .steal_batch_and_pop(&self.local_queue.local)
         {
             e @ Steal::Success(_) => {
-                self.handled_global += 1;
+                self.metrics.handled_global += 1;
                 return (e, false);
             }
             Steal::Retry => need_retry = true,
@@ -89,7 +149,7 @@ impl<Task> PoolContext<Task> {
             if pos != self.local_queue.pos {
                 match stealer.steal_batch_and_pop(&self.local_queue.local) {
                     e @ Steal::Success(_) => {
-                        self.handled_steal += 1;
+                        self.metrics.handled_steal += 1;
                         return (e, false);
                     }
                     Steal::Retry => need_retry = true,
@@ -97,64 +157,101 @@ impl<Task> PoolContext<Task> {
                 }
             }
         }
-        self.handled_miss += 1;
         if need_retry {
+            self.metrics.handled_retry += 1;
             (Steal::Retry, false)
         } else {
+            self.metrics.handled_miss += 1;
             (Steal::Empty, false)
         }
     }
 
-    fn park(&mut self, timeout: Option<Duration>) -> (Steal<SchedUnit<Task>>, bool) {
+    fn get_deadline(&mut self, sched_config: &SchedConfig) -> Option<Instant> {
+        let miss = self.metrics.miss() - self.metrics_snap.miss();
+        let hit = self.metrics.hit() - self.metrics_snap.hit();
+        self.metrics_snap = self.metrics.clone();
+        if (miss as f64 / (miss + hit) as f64) < sched_config.tolerate_miss_rate {
+            Some(Instant::now() + sched_config.max_idle_time)
+        } else {
+            None
+        }
+    }
+
+    fn park(&mut self, sched_config: &SchedConfig) -> (Steal<SchedUnit<Task>>, bool) {
         let address = &*self.local_queue.core as *const QueueCore<Task> as usize;
-        let timeout = timeout.map(|t| Instant::now() + t);
+        let mut deadline = self.get_deadline(sched_config);
+        let mut pause = true;
         let token = ParkToken(self.local_queue.pos);
         let mut task = (Steal::Empty, false);
-        let res = unsafe {
-            parking_lot_core::park(
-                address,
-                || {
-                    self.local_queue.core.sleep();
-                    let should_shutdown = self.local_queue.core.should_shutdown();
-                    if should_shutdown {
-                        false
+        // let pos = self.local_queue.pos;
+        loop {
+            let res = unsafe {
+                parking_lot_core::park(
+                    address,
+                    || {
+                        // running_info should be updated before fetching tasks, as unpark
+                        // works in the order of push -> check running info
+                        let (running_info, released) = self.local_queue.core.sleep(
+                            sched_config.min_thread_count,
+                            deadline.is_none(),
+                            pause,
+                        );
+                        // A thread can only be paused once before waken up.
+                        pause = false;
+                        /*if released {
+                            println!("{} release a slot", pos);
+                        }*/
+                        self.park_metrics.desc_slots += released as usize;
+                        if is_shutdown(running_info) {
+                            false
+                        } else if deadline.is_some() || !is_slot_full(running_info) {
+                            task = self.deque_a_task();
+                            if task.0.is_empty() {
+                                true
+                            } else {
+                                self.local_queue.core.wake_up(running_info);
+                                false
+                            }
+                        } else {
+                            true
+                        }
+                    },
+                    || {},
+                    |_, _| (),
+                    token,
+                    deadline,
+                )
+            };
+            return match res {
+                ParkResult::TimedOut => {
+                    if deadline.is_some() {
+                        deadline = None;
+                        continue;
                     } else {
-                        task = self.deque_a_task();
-                        task.0.is_empty()
+                        (Steal::Empty, false)
                     }
-                },
-                || {},
-                |_, _| (),
-                token,
-                timeout,
-            )
-        };
-        match res {
-            ParkResult::TimedOut => (Steal::Empty, false),
-            ParkResult::Invalid => {
-                if !task.0.is_empty() {
-                    self.local_queue.core.wake_up();
                 }
-                task
-            }
-            ParkResult::Unparked(from) => {
-                // println!("{} unpark by {}", self.local_queue.pos, from.0);
-                self.local_queue.core.wake_up();
-                self.park_cnt[from.0] += 1;
-                (Steal::Retry, false)
-            }
+                ParkResult::Invalid => task,
+                ParkResult::Unparked(from) => {
+                    // println!("{} unpark by {}", self.local_queue.pos, from.0);
+                    // If slot has been released, then it must be unparked after the slot
+                    // has been allocated; if slot has not been released, it doesn't need
+                    // allocate another apparently.
+                    if from.0 < self.park_metrics.park_cnt.len() {
+                        self.park_metrics.park_cnt[from.0] += 1;
+                        (Steal::Retry, false)
+                    } else {
+                        (Steal::Empty, false)
+                    }
+                }
+            };
         }
     }
 
     fn dump_metrics(&self) {
         println!(
-            "{} park {:?} global {} local {} steal {} miss {}",
-            self.local_queue.pos,
-            self.park_cnt,
-            self.handled_global,
-            self.handled_local,
-            self.handled_steal,
-            self.handled_miss
+            "{} park {:?} {:?}",
+            self.local_queue.pos, self.park_metrics, self.metrics,
         );
     }
 }
@@ -195,34 +292,180 @@ pub trait RunnerFactory {
     fn produce(&mut self) -> Self::Runner;
 }
 
+struct SlotManager {
+    start_time: Instant,
+    next_spawn: AtomicU64,
+    backoff: Duration,
+}
+
+impl SlotManager {
+    fn new(backoff: Duration) -> SlotManager {
+        SlotManager {
+            start_time: Instant::now(),
+            next_spawn: AtomicU64::new(0),
+            backoff,
+        }
+    }
+}
+
+struct SlotAgent {
+    manager: Arc<SlotManager>,
+    next_spawn_cache: Duration,
+}
+
+impl SlotAgent {
+    fn new(manager: Arc<SlotManager>) -> SlotAgent {
+        SlotAgent {
+            next_spawn_cache: Duration::from_micros(
+                manager.next_spawn.load(Ordering::SeqCst) as u64
+            ),
+            manager,
+        }
+    }
+
+    pub fn acquire_slot(&mut self, time: Instant) -> bool {
+        if time <= self.manager.start_time {
+            return false;
+        }
+
+        let dur = time.duration_since(self.manager.start_time);
+        let next_dur = dur + self.manager.backoff;
+        let next_micros = next_dur.as_micros() as u64;
+        let mut expect_elapsed = self.next_spawn_cache.as_micros() as u64;
+        loop {
+            if dur < self.next_spawn_cache {
+                return false;
+            }
+            match self.manager.next_spawn.compare_exchange_weak(
+                expect_elapsed,
+                next_micros,
+                Ordering::SeqCst,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.next_spawn_cache = next_dur;
+                    return true;
+                }
+                Err(m) => {
+                    self.next_spawn_cache = Duration::from_micros(m);
+                    expect_elapsed = m;
+                }
+            }
+        }
+    }
+}
+
 struct QueueCore<Task> {
     global: crossbeam_deque::Injector<SchedUnit<Task>>,
     stealers: Vec<crossbeam_deque::Stealer<SchedUnit<Task>>>,
-    running_count: AtomicUsize,
-    min_thread_count: usize,
+    // shutdown bit | available_slots | running_count
+    running_info: AtomicUsize,
     locals: Mutex<Vec<Option<crossbeam_deque::Worker<SchedUnit<Task>>>>>,
 }
 
 impl<Task> QueueCore<Task> {
+    fn sleep(&self, min_slot_count: usize, reduce_slot: bool, pause: bool) -> (usize, bool) {
+        let mut running_info = self.running_info.load(Ordering::Acquire);
+        loop {
+            let mut new_info = running_info;
+            if reduce_slot {
+                let slot_cnt = slot_count(running_info);
+                let running_cnt = running_count(running_info);
+                debug_assert!(slot_cnt >= running_cnt);
+                if slot_cnt > min_slot_count && slot_cnt > running_cnt {
+                    new_info -= SLOTS_BASE
+                }
+            }
+            if pause {
+                new_info -= RUNNING_BASE;
+            } else if new_info == running_info {
+                return (running_info, false);
+            }
+            if let Err(new_info) = self.running_info.compare_exchange_weak(
+                running_info,
+                new_info,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                running_info = new_info;
+                continue;
+            }
+            return (new_info, running_info - new_info >= SLOTS_BASE);
+        }
+    }
+
+    fn wake_up(&self, mut running_info: usize) {
+        loop {
+            let new_info = running_info + RUNNING_BASE;
+            match self.running_info.compare_exchange_weak(
+                running_info,
+                new_info,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(new_info) => running_info = new_info,
+            }
+        }
+    }
+
+    fn allocate_a_slot(&self, mut last_info: usize) {
+        loop {
+            let new_info = last_info + SLOTS_BASE;
+            match self.running_info.compare_exchange_weak(
+                last_info,
+                new_info,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(info) => last_info = info,
+            }
+        }
+    }
+
     fn should_shutdown(&self) -> bool {
-        self.running_count.load(Ordering::SeqCst) & SHUTDOWN_MARK == SHUTDOWN_MARK
+        is_shutdown(self.running_info.load(Ordering::SeqCst))
     }
 
     fn shutdown(&self) {
-        self.running_count
-            .fetch_add(SHUTDOWN_MARK, Ordering::SeqCst);
-    }
-
-    fn sleep(&self) {
-        self.running_count.fetch_sub(1, Ordering::SeqCst);
-    }
-
-    fn wake_up(&self) {
-        self.running_count.fetch_add(1, Ordering::SeqCst);
+        self.running_info.fetch_or(SHUTDOWN_BIT, Ordering::SeqCst);
     }
 
     fn push(&self, task: Task) {
         self.global.push(SchedUnit::new(task));
+    }
+
+    fn unpark_one(&self, address: usize, from: usize) -> bool {
+        let token = UnparkToken(from);
+        let mut to_skipped = usize::MAX;
+        let mut running_info = 0;
+        let res = unsafe {
+            parking_lot_core::unpark_filter(
+                address,
+                |_| {
+                    if to_skipped == usize::MAX {
+                        running_info = self.running_info.load(Ordering::Acquire);
+                        if is_slot_full(running_info) {
+                            return FilterOp::Stop;
+                        }
+                        to_skipped = self.stealers.len() - slot_count(running_info) + 1;
+                    }
+                    if to_skipped > 1 {
+                        to_skipped -= 1;
+                        FilterOp::Skip
+                    } else if to_skipped == 1 {
+                        to_skipped -= 1;
+                        self.wake_up(running_info);
+                        FilterOp::Unpark
+                    } else {
+                        FilterOp::Stop
+                    }
+                },
+                |_| token,
+            )
+        };
+        res.unparked_threads > 0
     }
 }
 
@@ -233,16 +476,36 @@ struct LocalQueue<Task> {
 }
 
 impl<Task> LocalQueue<Task> {
-    fn unpark_one(&self) -> bool {
-        let cnt = self.core.running_count.load(Ordering::SeqCst);
-        if cnt | SHUTDOWN_MARK == SHUTDOWN_MARK | self.core.stealers.len() {
-            return false;
+    fn unpark_one(&mut self, agent: &mut SlotAgent, check_time: Instant) -> (bool, bool) {
+        let running_info = self.core.running_info.load(Ordering::SeqCst);
+        if is_shutdown(running_info) {
+            return (false, false);
         }
+        let running_count = running_count(running_info);
+        let slot_count = slot_count(running_info);
+        let mut allocated = false;
+        if running_count == slot_count {
+            if slot_count == self.core.stealers.len() {
+                return (false, false);
+            }
+
+            if !agent.acquire_slot(check_time) {
+                return (false, false);
+            }
+
+            allocated = true;
+            // println!("{} allocate a slot", self.pos);
+            self.core.allocate_a_slot(running_info);
+        }
+        debug_assert!(
+            running_count <= slot_count,
+            "{} {}",
+            running_count,
+            slot_count
+        );
 
         let address = &*self.core as *const QueueCore<Task> as usize;
-        let token = UnparkToken(self.pos);
-        let res = unsafe { parking_lot_core::unpark_one(address, |_| token) };
-        res.unparked_threads > 0
+        (self.core.unpark_one(address, self.pos), allocated)
     }
 }
 
@@ -279,29 +542,20 @@ impl<Task> Queues<Task> {
     }
 
     fn unpark_one(&self) -> bool {
-        let cnt = self.core.running_count.load(Ordering::SeqCst);
-        if cnt ^ SHUTDOWN_MARK >= SHUTDOWN_MARK + self.core.min_thread_count {
+        let info = self.core.running_info.load(Ordering::SeqCst);
+        if is_shutdown(info) || is_slot_full(info) {
             return false;
         }
 
         let address = &*self.core as *const QueueCore<Task> as usize;
-        let token = UnparkToken(self.core.stealers.len());
-        let mut parked = false;
-        let res = unsafe {
-            parking_lot_core::unpark_filter(
-                address,
-                |ParkToken(id)| {
-                    if !parked && (id < self.core.min_thread_count || cnt >= SHUTDOWN_MARK) {
-                        parked = true;
-                        FilterOp::Unpark
-                    } else {
-                        FilterOp::Skip
-                    }
-                },
-                |_| token,
-            )
-        };
-        res.unparked_threads > 0
+        self.core.unpark_one(address, self.core.stealers.len())
+    }
+
+    fn unpark_shutdown(&self) {
+        let address = &*self.core as *const QueueCore<Task> as usize;
+        unsafe {
+            parking_lot_core::unpark_all(address, UnparkToken(self.core.stealers.len() + 1));
+        }
     }
 
     fn push(&self, task: Task) {
@@ -321,23 +575,30 @@ fn elapsed(start: Instant, end: Instant) -> Duration {
 pub struct WorkerThread<R: Runner> {
     local: LocalQueue<R::Task>,
     runner: R,
+    agent: SlotAgent,
     sched_config: SchedConfig,
 }
 
 impl<R: Runner> WorkerThread<R> {
-    fn new(local: LocalQueue<R::Task>, runner: R, sched_config: SchedConfig) -> WorkerThread<R> {
+    fn new(
+        local: LocalQueue<R::Task>,
+        agent: SlotAgent,
+        runner: R,
+        sched_config: SchedConfig,
+    ) -> WorkerThread<R> {
         WorkerThread {
             local,
+            agent,
             runner,
             sched_config,
         }
     }
 
     fn run(mut self) {
-        let mut ctx = PoolContext::new(self.local);
+        let mut ctx = PoolContext::new(self.local, self.agent);
         let mut last_spawn_time = Instant::now();
-        ctx.local_queue.core.wake_up();
         self.runner.start(&mut ctx);
+
         'out: while !ctx.local_queue.core.should_shutdown() {
             let (t, is_local) = match ctx.deque_a_task() {
                 (Steal::Success(e), b) => (e, b),
@@ -353,7 +614,7 @@ impl<R: Runner> WorkerThread<R> {
                             if !self.runner.pause(&ctx) {
                                 continue;
                             }
-                            match ctx.park(self.sched_config.max_idle_time) {
+                            match ctx.park(&self.sched_config) {
                                 (Steal::Retry, _) => {
                                     self.runner.resume(&ctx);
                                     continue 'out;
@@ -376,8 +637,12 @@ impl<R: Runner> WorkerThread<R> {
                 || is_local
                     && elapsed(last_spawn_time, now) >= self.sched_config.local_spawn_backoff
             {
-                ctx.local_queue.unpark_one();
-                last_spawn_time = now;
+                let (unparked, allocated) = ctx.local_queue.unpark_one(&mut ctx.agent, now);
+                if unparked {
+                    last_spawn_time = now;
+                    ctx.park_metrics.unpark_times += 1;
+                }
+                ctx.park_metrics.incr_slots += allocated as usize;
             }
             self.runner.handle(&mut ctx, t.task);
         }
@@ -391,7 +656,8 @@ struct SchedConfig {
     max_thread_count: usize,
     min_thread_count: usize,
     max_inplace_spin: usize,
-    max_idle_time: Option<Duration>,
+    max_idle_time: Duration,
+    tolerate_miss_rate: f64,
     max_wait_time: Duration,
     local_spawn_backoff: Duration,
 }
@@ -413,10 +679,12 @@ impl<T: Send> LazyConfig<T> {
         F::Runner: Runner<Task = T> + Send + 'static,
     {
         let mut threads = Vec::with_capacity(self.cfg.sched_config.max_thread_count);
+        let manager = Arc::new(SlotManager::new(self.cfg.sched_config.local_spawn_backoff));
         for i in 0..self.cfg.sched_config.max_thread_count {
             let r = factory.produce();
             let local_queue = self.queues.acquire_local_queue();
-            let th = WorkerThread::new(local_queue, r, self.cfg.sched_config.clone());
+            let agent = SlotAgent::new(manager.clone());
+            let th = WorkerThread::new(local_queue, agent, r, self.cfg.sched_config.clone());
             let mut builder = Builder::new().name(format!("{}-{}", self.cfg.name_prefix, i));
             if let Some(size) = self.cfg.stack_size {
                 builder = builder.stack_size(size)
@@ -446,9 +714,15 @@ impl Config {
                 max_thread_count: num_cpus::get(),
                 min_thread_count: 1,
                 max_inplace_spin: 4,
-                max_idle_time: None,
+                max_idle_time: Duration::from_millis(1),
+                // In general, when a thread is waken up to handle tasks,
+                // it can handle at least one task, then the waken up makes sence.
+                // After a thread handles a request, it will sleep again when there
+                // are three continous misses. So the miss rate of a reasonalbe woken up
+                // should not be higher than 3 / 4.
+                tolerate_miss_rate: 3.0 / 4.0,
                 max_wait_time: Duration::from_millis(1),
-                local_spawn_backoff: Duration::from_micros(1000),
+                local_spawn_backoff: Duration::from_millis(1),
             },
         }
     }
@@ -473,7 +747,7 @@ impl Config {
     }
 
     pub fn max_idle_time(&mut self, time: Duration) -> &mut Config {
-        self.sched_config.max_idle_time = Some(time);
+        self.sched_config.max_idle_time = time;
         self
     }
 
@@ -496,6 +770,8 @@ impl Config {
 
     pub fn freeze<T>(&self) -> (Remote<T>, LazyConfig<T>) {
         let injector = crossbeam_deque::Injector::new();
+        assert!(self.sched_config.max_thread_count < SLOTS_BASE >> RUNNING_BASE_SHIFT);
+        assert!(self.sched_config.min_thread_count <= self.sched_config.max_thread_count);
         let mut workers = Vec::with_capacity(self.sched_config.max_thread_count);
         let mut stealers = Vec::with_capacity(self.sched_config.max_thread_count);
         for _ in 0..self.sched_config.max_thread_count {
@@ -503,13 +779,14 @@ impl Config {
             stealers.push(w.stealer());
             workers.push(Some(w));
         }
+        let running_info = (self.sched_config.max_thread_count << SLOTS_BASE_SHIFT)
+            | (self.sched_config.max_thread_count << RUNNING_BASE_SHIFT);
         let queues = Queues {
             core: Arc::new(QueueCore {
                 global: injector,
                 stealers,
                 locals: Mutex::new(workers),
-                running_count: AtomicUsize::new(0),
-                min_thread_count: self.sched_config.min_thread_count,
+                running_info: AtomicUsize::new(running_info),
             }),
         };
         (
@@ -553,7 +830,7 @@ impl<Task> ThreadPool<Task> {
         self.queues.core.shutdown();
         let mut threads = mem::replace(&mut *self.threads.lock().unwrap(), Vec::new());
         for _ in 0..threads.len() {
-            self.queues.unpark_one();
+            self.queues.unpark_shutdown();
         }
         for j in threads.drain(..) {
             j.join().unwrap();
