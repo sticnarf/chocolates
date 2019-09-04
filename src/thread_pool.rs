@@ -31,6 +31,11 @@ const fn is_slot_full(info: usize) -> bool {
 }
 
 #[inline]
+const fn is_slot_empty(info: usize) -> bool {
+    running_count(info) == 0
+}
+
+#[inline]
 const fn is_shutdown(info: usize) -> bool {
     info & SHUTDOWN_BIT == SHUTDOWN_BIT
 }
@@ -91,13 +96,13 @@ pub struct PoolContext<Task> {
     local_queue: LocalQueue<Task>,
     metrics: HandleMetrics,
     park_metrics: ParkMetrics,
-    agent: SlotAgent,
+    agent: SpawnAgent,
     spawn_local: usize,
     metrics_snap: HandleMetrics,
 }
 
 impl<Task> PoolContext<Task> {
-    fn new(queue: LocalQueue<Task>, agent: SlotAgent) -> PoolContext<Task> {
+    fn new(queue: LocalQueue<Task>, agent: SpawnAgent) -> PoolContext<Task> {
         PoolContext {
             metrics: HandleMetrics::default(),
             spawn_local: 0,
@@ -292,72 +297,117 @@ pub trait RunnerFactory {
     fn produce(&mut self) -> Self::Runner;
 }
 
-struct SlotManager {
-    start_time: Instant,
-    next_spawn: AtomicU64,
+struct BackOff {
+    next: AtomicU64,
     backoff: Duration,
 }
 
-impl SlotManager {
-    fn new(backoff: Duration) -> SlotManager {
-        SlotManager {
-            start_time: Instant::now(),
-            next_spawn: AtomicU64::new(0),
+impl BackOff {
+    fn new(backoff: Duration) -> BackOff {
+        BackOff {
+            next: AtomicU64::new(0),
             backoff,
         }
     }
-}
 
-struct SlotAgent {
-    manager: Arc<SlotManager>,
-    next_spawn_cache: Duration,
-}
-
-impl SlotAgent {
-    fn new(manager: Arc<SlotManager>) -> SlotAgent {
-        SlotAgent {
-            next_spawn_cache: Duration::from_micros(
-                manager.next_spawn.load(Ordering::SeqCst) as u64
-            ),
-            manager,
-        }
+    fn next_backoff(&self) -> Duration {
+        Duration::from_micros(self.next.load(Ordering::Acquire))
     }
 
-    pub fn acquire_slot(&mut self, time: Instant) -> bool {
-        if time <= self.manager.start_time {
+    fn should_backoff(&self, curr_dur: Duration, expected_elapsed: &mut Duration) -> bool {
+        if curr_dur < *expected_elapsed {
             return false;
         }
 
-        let dur = time.duration_since(self.manager.start_time);
-        let next_dur = dur + self.manager.backoff;
+        let next_dur = curr_dur + self.backoff;
         let next_micros = next_dur.as_micros() as u64;
-        let mut expect_elapsed = self.next_spawn_cache.as_micros() as u64;
         loop {
-            if dur < self.next_spawn_cache {
-                return false;
-            }
-            match self.manager.next_spawn.compare_exchange_weak(
-                expect_elapsed,
+            match self.next.compare_exchange_weak(
+                expected_elapsed.as_micros() as u64,
                 next_micros,
                 Ordering::SeqCst,
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    self.next_spawn_cache = next_dur;
+                    *expected_elapsed = next_dur;
                     return true;
                 }
                 Err(m) => {
-                    self.next_spawn_cache = Duration::from_micros(m);
-                    expect_elapsed = m;
+                    *expected_elapsed = Duration::from_micros(m);
+                    if curr_dur < *expected_elapsed {
+                        return false;
+                    }
                 }
             }
         }
+    }
+}
+
+struct SpawnManager {
+    start_time: Instant,
+    spawn_backoff: BackOff,
+    alloc_slot_backoff: BackOff,
+}
+
+impl SpawnManager {
+    fn new(sched_config: &SchedConfig) -> SpawnManager {
+        SpawnManager {
+            start_time: Instant::now(),
+            spawn_backoff: BackOff::new(sched_config.spawn_backoff),
+            alloc_slot_backoff: BackOff::new(sched_config.alloc_slot_backoff),
+        }
+    }
+
+    pub fn acquire_slot(&self, time: Instant, expected_elapsed: &mut Duration) -> bool {
+        let dur = elapsed(self.start_time, time);
+        !self
+            .alloc_slot_backoff
+            .should_backoff(dur, expected_elapsed)
+    }
+
+    pub fn next_slot_elapsed(&self) -> Duration {
+        self.alloc_slot_backoff.next_backoff()
+    }
+
+    pub fn acquire_spawn(&self, time: Instant, expected_elapsed: &mut Duration) -> bool {
+        let dur = elapsed(self.start_time, time);
+        !self.spawn_backoff.should_backoff(dur, expected_elapsed)
+    }
+
+    pub fn next_spawn_elapsed(&self) -> Duration {
+        self.spawn_backoff.next_backoff()
+    }
+}
+
+struct SpawnAgent {
+    manager: Arc<SpawnManager>,
+    next_spawn_cache: Duration,
+    next_alloc_slot_cache: Duration,
+}
+
+impl SpawnAgent {
+    fn new(manager: Arc<SpawnManager>) -> SpawnAgent {
+        SpawnAgent {
+            next_spawn_cache: manager.next_spawn_elapsed(),
+            next_alloc_slot_cache: manager.next_slot_elapsed(),
+            manager,
+        }
+    }
+
+    pub fn acquire_slot(&mut self, time: Instant) -> bool {
+        self.manager
+            .acquire_slot(time, &mut self.next_alloc_slot_cache)
+    }
+
+    pub fn acquire_spawn(&mut self, time: Instant) -> bool {
+        self.manager.acquire_slot(time, &mut self.next_spawn_cache)
     }
 }
 
 struct QueueCore<Task> {
     global: crossbeam_deque::Injector<SchedUnit<Task>>,
     stealers: Vec<crossbeam_deque::Stealer<SchedUnit<Task>>>,
+    manager: Arc<SpawnManager>,
     // shutdown bit | available_slots | running_count
     running_info: AtomicUsize,
     locals: Mutex<Vec<Option<crossbeam_deque::Worker<SchedUnit<Task>>>>>,
@@ -432,10 +482,6 @@ impl<Task> QueueCore<Task> {
         self.running_info.fetch_or(SHUTDOWN_BIT, Ordering::SeqCst);
     }
 
-    fn push(&self, task: Task) {
-        self.global.push(SchedUnit::new(task));
-    }
-
     fn unpark_one(&self, address: usize, from: usize) -> bool {
         let token = UnparkToken(from);
         let mut to_skipped = usize::MAX;
@@ -476,7 +522,7 @@ struct LocalQueue<Task> {
 }
 
 impl<Task> LocalQueue<Task> {
-    fn unpark_one(&mut self, agent: &mut SlotAgent, check_time: Instant) -> (bool, bool) {
+    fn unpark_one(&mut self, agent: &mut SpawnAgent, check_time: Instant) -> (bool, bool) {
         let running_info = self.core.running_info.load(Ordering::SeqCst);
         if is_shutdown(running_info) {
             return (false, false);
@@ -489,6 +535,10 @@ impl<Task> LocalQueue<Task> {
                 return (false, false);
             }
 
+            if !agent.acquire_spawn(check_time) {
+                return (false, false);
+            }
+
             if !agent.acquire_slot(check_time) {
                 return (false, false);
             }
@@ -496,6 +546,10 @@ impl<Task> LocalQueue<Task> {
             allocated = true;
             // println!("{} allocate a slot", self.pos);
             self.core.allocate_a_slot(running_info);
+        } else {
+            if !agent.acquire_spawn(check_time) {
+                return (false, allocated);
+            }
         }
         debug_assert!(
             running_count <= slot_count,
@@ -541,10 +595,21 @@ impl<Task> Queues<Task> {
         assert!(locals[q.pos].replace(q.local).is_none());
     }
 
-    fn unpark_one(&self) -> bool {
+    fn unpark_one(&self, check_time: Instant) -> bool {
         let info = self.core.running_info.load(Ordering::SeqCst);
         if is_shutdown(info) || is_slot_full(info) {
             return false;
+        }
+
+        if !is_slot_empty(info) {
+            let mut next_spawn_elapsed = self.core.manager.next_spawn_elapsed();
+            if !self
+                .core
+                .manager
+                .acquire_spawn(check_time, &mut next_spawn_elapsed)
+            {
+                return false;
+            }
         }
 
         let address = &*self.core as *const QueueCore<Task> as usize;
@@ -559,8 +624,10 @@ impl<Task> Queues<Task> {
     }
 
     fn push(&self, task: Task) {
-        self.core.push(task);
-        self.unpark_one();
+        let u = SchedUnit::new(task);
+        let sched_time = u.sched_time;
+        self.core.global.push(u);
+        self.unpark_one(sched_time);
     }
 }
 
@@ -575,14 +642,14 @@ fn elapsed(start: Instant, end: Instant) -> Duration {
 pub struct WorkerThread<R: Runner> {
     local: LocalQueue<R::Task>,
     runner: R,
-    agent: SlotAgent,
+    agent: SpawnAgent,
     sched_config: SchedConfig,
 }
 
 impl<R: Runner> WorkerThread<R> {
     fn new(
         local: LocalQueue<R::Task>,
-        agent: SlotAgent,
+        agent: SpawnAgent,
         runner: R,
         sched_config: SchedConfig,
     ) -> WorkerThread<R> {
@@ -635,7 +702,7 @@ impl<R: Runner> WorkerThread<R> {
             let now = Instant::now();
             if elapsed(t.sched_time, now) >= self.sched_config.max_wait_time
                 || is_local
-                    && elapsed(last_spawn_time, now) >= self.sched_config.local_spawn_backoff
+                    && elapsed(last_spawn_time, now) >= self.sched_config.spawn_backoff
             {
                 let (unparked, allocated) = ctx.local_queue.unpark_one(&mut ctx.agent, now);
                 if unparked {
@@ -659,7 +726,8 @@ struct SchedConfig {
     max_idle_time: Duration,
     tolerate_miss_rate: f64,
     max_wait_time: Duration,
-    local_spawn_backoff: Duration,
+    spawn_backoff: Duration,
+    alloc_slot_backoff: Duration,
 }
 
 pub struct LazyConfig<T> {
@@ -679,11 +747,10 @@ impl<T: Send> LazyConfig<T> {
         F::Runner: Runner<Task = T> + Send + 'static,
     {
         let mut threads = Vec::with_capacity(self.cfg.sched_config.max_thread_count);
-        let manager = Arc::new(SlotManager::new(self.cfg.sched_config.local_spawn_backoff));
         for i in 0..self.cfg.sched_config.max_thread_count {
             let r = factory.produce();
             let local_queue = self.queues.acquire_local_queue();
-            let agent = SlotAgent::new(manager.clone());
+            let agent = SpawnAgent::new(self.queues.core.manager.clone());
             let th = WorkerThread::new(local_queue, agent, r, self.cfg.sched_config.clone());
             let mut builder = Builder::new().name(format!("{}-{}", self.cfg.name_prefix, i));
             if let Some(size) = self.cfg.stack_size {
@@ -722,7 +789,8 @@ impl Config {
                 // should not be higher than 3 / 4.
                 tolerate_miss_rate: 3.0 / 4.0,
                 max_wait_time: Duration::from_millis(1),
-                local_spawn_backoff: Duration::from_millis(1),
+                spawn_backoff: Duration::from_millis(1),
+                alloc_slot_backoff: Duration::from_millis(2),
             },
         }
     }
@@ -756,8 +824,13 @@ impl Config {
         self
     }
 
-    pub fn local_spawn_backoff(&mut self, time: Duration) -> &mut Config {
-        self.sched_config.local_spawn_backoff = time;
+    pub fn spawn_backoff(&mut self, time: Duration) -> &mut Config {
+        self.sched_config.spawn_backoff = time;
+        self
+    }
+
+    pub fn alloc_slot_backoff(&mut self, time: Duration) -> &mut Config {
+        self.sched_config.alloc_slot_backoff = time;
         self
     }
 
@@ -781,10 +854,12 @@ impl Config {
         }
         let running_info = (self.sched_config.max_thread_count << SLOTS_BASE_SHIFT)
             | (self.sched_config.max_thread_count << RUNNING_BASE_SHIFT);
+        let manager = Arc::new(SpawnManager::new(&self.sched_config));
         let queues = Queues {
             core: Arc::new(QueueCore {
                 global: injector,
                 stealers,
+                manager,
                 locals: Mutex::new(workers),
                 running_info: AtomicUsize::new(running_info),
             }),
