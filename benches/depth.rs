@@ -70,15 +70,38 @@ mod cpupool {
 }
 
 mod thread_pool_callback {
-    use chocolates::thread_pool::callback::{Handle, RunnerFactory};
-    use chocolates::thread_pool::Config;
+    use chocolates::thread_pool::callback::{Handle, RunnerFactory, Task};
+    use chocolates::thread_pool::{Config, GlobalQueue};
     use criterion::Bencher;
     use std::sync::mpsc;
 
-    pub fn chained_spawn(b: &mut Bencher) {
-        let pool = Config::new("chain-spawn").spawn(RunnerFactory::new());
+    use chocolates::thread_pool::SchedUnit;
+    use crossbeam_deque::Steal;
+    struct GQueue(crossbeam_deque::Injector<SchedUnit<Task<GQueue>>>);
+    impl GlobalQueue for GQueue {
+        type RawTask = Task<GQueue>;
+        type Task = Task<GQueue>;
 
-        fn spawn(c: &mut Handle<'_>, res_tx: mpsc::Sender<()>, n: usize) {
+        fn steal_batch_and_pop(
+            &self,
+            local_queue: &crossbeam_deque::Worker<SchedUnit<Self::Task>>,
+        ) -> Steal<SchedUnit<Self::Task>> {
+            crossbeam_deque::Injector::steal_batch_and_pop(&self.0, local_queue)
+        }
+        fn push_raw_task(&self, raw_task: SchedUnit<Self::RawTask>) {
+            self.0.push(raw_task);
+        }
+    }
+
+    pub fn chained_spawn(b: &mut Bencher) {
+        let pool = Config::new("chain-spawn").spawn(RunnerFactory::new(), || {
+            GQueue(crossbeam_deque::Injector::new())
+        });
+
+        fn spawn<G>(c: &mut Handle<'_, G>, res_tx: mpsc::Sender<()>, n: usize)
+        where
+            G: GlobalQueue<Task = Task<G>, RawTask = Task<G>>,
+        {
             if n == 0 {
                 res_tx.send(()).unwrap();
             } else {
@@ -97,18 +120,21 @@ mod thread_pool_callback {
 }
 
 mod thread_pool_future {
-    use chocolates::thread_pool::future::{RunnerFactory, Sender};
-    use chocolates::thread_pool::Config;
+    use chocolates::thread_pool::future::{RunnerFactory, Sender, TaskUnit};
+    use chocolates::thread_pool::{Config, GlobalQueue};
     use criterion::Bencher;
     use futures::future;
-    use std::sync::mpsc;
+    use std::sync::{mpsc, Arc};
 
     pub fn chained_spawn(b: &mut Bencher) {
         let threadpool = Config::new("chained_spawn")
             .max_idle_time(std::time::Duration::from_secs(3))
-            .spawn(RunnerFactory::new(4));
+            .spawn(RunnerFactory::new(4), || crossbeam_deque::Injector::new());
 
-        fn spawn(pool_tx: Sender, res_tx: mpsc::Sender<()>, n: usize) {
+        fn spawn<G>(pool_tx: Sender<G>, res_tx: mpsc::Sender<()>, n: usize)
+        where
+            G: GlobalQueue<Task = Arc<TaskUnit>, RawTask = Arc<TaskUnit>> + Send + Sync + 'static,
+        {
             if n == 0 {
                 res_tx.send(()).unwrap();
             } else {
@@ -127,7 +153,6 @@ mod thread_pool_future {
             res_rx.recv().unwrap();
         });
     }
-
 }
 
 fn chained_spawn(b: &mut Criterion) {

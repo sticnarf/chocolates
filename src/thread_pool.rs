@@ -40,7 +40,7 @@ const fn is_shutdown(info: usize) -> bool {
     info & SHUTDOWN_BIT == SHUTDOWN_BIT
 }
 
-struct SchedUnit<Task> {
+pub struct SchedUnit<Task> {
     task: Task,
     sched_time: Instant,
 }
@@ -92,8 +92,8 @@ impl ParkMetrics {
     }
 }
 
-pub struct PoolContext<Task> {
-    local_queue: LocalQueue<Task>,
+pub struct PoolContext<G: GlobalQueue> {
+    local_queue: LocalQueue<G>,
     metrics: HandleMetrics,
     park_metrics: ParkMetrics,
     agent: SpawnAgent,
@@ -101,8 +101,8 @@ pub struct PoolContext<Task> {
     metrics_snap: HandleMetrics,
 }
 
-impl<Task> PoolContext<Task> {
-    fn new(queue: LocalQueue<Task>, agent: SpawnAgent) -> PoolContext<Task> {
+impl<G: GlobalQueue> PoolContext<G> {
+    fn new(queue: LocalQueue<G>, agent: SpawnAgent) -> PoolContext<G> {
         PoolContext {
             metrics: HandleMetrics::default(),
             spawn_local: 0,
@@ -113,12 +113,12 @@ impl<Task> PoolContext<Task> {
         }
     }
 
-    pub fn spawn(&mut self, t: impl Into<Task>) {
+    pub fn spawn(&mut self, t: impl Into<G::Task>) {
         self.spawn_local += 1;
         self.local_queue.local.push(SchedUnit::new(t.into()));
     }
 
-    pub fn remote(&self) -> Remote<Task> {
+    pub fn remote(&self) -> Remote<G> {
         Remote {
             queue: Queues {
                 core: self.local_queue.core.clone(),
@@ -127,7 +127,7 @@ impl<Task> PoolContext<Task> {
     }
 
     #[inline]
-    fn deque_a_task(&mut self) -> (Steal<SchedUnit<Task>>, bool) {
+    fn deque_a_task(&mut self) -> (Steal<SchedUnit<G::Task>>, bool) {
         if let Some(e) = self.local_queue.local.pop() {
             self.metrics.handled_local += 1;
             return (Steal::Success(e), true);
@@ -135,7 +135,7 @@ impl<Task> PoolContext<Task> {
         self.deque_global_task()
     }
 
-    fn deque_global_task(&mut self) -> (Steal<SchedUnit<Task>>, bool) {
+    fn deque_global_task(&mut self) -> (Steal<SchedUnit<G::Task>>, bool) {
         let mut need_retry = false;
         match self
             .local_queue
@@ -182,8 +182,8 @@ impl<Task> PoolContext<Task> {
         }
     }
 
-    fn park(&mut self, sched_config: &SchedConfig) -> (Steal<SchedUnit<Task>>, bool) {
-        let address = &*self.local_queue.core as *const QueueCore<Task> as usize;
+    fn park(&mut self, sched_config: &SchedConfig) -> (Steal<SchedUnit<G::Task>>, bool) {
+        let address = &*self.local_queue.core as *const QueueCore<G> as usize;
         let mut deadline = self.get_deadline(sched_config);
         let mut pause = true;
         let token = ParkToken(self.local_queue.pos);
@@ -261,34 +261,66 @@ impl<Task> PoolContext<Task> {
     }
 }
 
-pub struct Remote<Task> {
-    queue: Queues<Task>,
+pub struct Remote<G: GlobalQueue> {
+    queue: Queues<G>,
 }
 
-impl<Task> Clone for Remote<Task> {
-    fn clone(&self) -> Remote<Task> {
+impl<G: GlobalQueue> Clone for Remote<G> {
+    fn clone(&self) -> Remote<G> {
         Remote {
             queue: self.queue.clone(),
         }
     }
 }
 
-impl<Task> Remote<Task> {
-    pub fn spawn(&self, t: impl Into<Task>) {
+impl<G: GlobalQueue> Remote<G> {
+    pub fn spawn(&self, t: impl Into<G::RawTask>) {
         self.queue.push(t.into());
     }
 }
 
-pub trait Runner {
+pub trait GlobalQueue {
+    type RawTask;
     type Task;
 
-    fn start(&mut self, _ctx: &mut PoolContext<Self::Task>) {}
-    fn handle(&mut self, ctx: &mut PoolContext<Self::Task>, task: Self::Task) -> bool;
-    fn pause(&mut self, _ctx: &PoolContext<Self::Task>) -> bool {
+    fn steal_batch_and_pop(
+        &self,
+        local_queue: &crossbeam_deque::Worker<SchedUnit<Self::Task>>,
+    ) -> Steal<SchedUnit<Self::Task>>;
+
+    fn push_raw_task(&self, raw_task: SchedUnit<Self::RawTask>);
+}
+
+impl<Task> GlobalQueue for crossbeam_deque::Injector<SchedUnit<Task>> {
+    type RawTask = Task;
+    type Task = Task;
+
+    fn steal_batch_and_pop(
+        &self,
+        local_queue: &crossbeam_deque::Worker<SchedUnit<Self::Task>>,
+    ) -> Steal<SchedUnit<Self::Task>> {
+        crossbeam_deque::Injector::steal_batch_and_pop(&self, local_queue)
+    }
+
+    fn push_raw_task(&self, raw_task: SchedUnit<Self::RawTask>) {
+        self.push(raw_task);
+    }
+}
+
+pub trait Runner {
+    type GlobalQueue: GlobalQueue;
+
+    fn start(&mut self, _ctx: &mut PoolContext<Self::GlobalQueue>) {}
+    fn handle(
+        &mut self,
+        ctx: &mut PoolContext<Self::GlobalQueue>,
+        task: <Self::GlobalQueue as GlobalQueue>::Task,
+    ) -> bool;
+    fn pause(&mut self, _ctx: &PoolContext<Self::GlobalQueue>) -> bool {
         true
     }
-    fn resume(&mut self, _ctx: &PoolContext<Self::Task>) {}
-    fn end(&mut self, _ctx: &PoolContext<Self::Task>) {}
+    fn resume(&mut self, _ctx: &PoolContext<Self::GlobalQueue>) {}
+    fn end(&mut self, _ctx: &PoolContext<Self::GlobalQueue>) {}
 }
 
 pub trait RunnerFactory {
@@ -404,16 +436,16 @@ impl SpawnAgent {
     }
 }
 
-struct QueueCore<Task> {
-    global: crossbeam_deque::Injector<SchedUnit<Task>>,
-    stealers: Vec<crossbeam_deque::Stealer<SchedUnit<Task>>>,
+struct QueueCore<G: GlobalQueue> {
+    global: G,
+    stealers: Vec<crossbeam_deque::Stealer<SchedUnit<G::Task>>>,
     manager: Arc<SpawnManager>,
     // shutdown bit | available_slots | running_count
     running_info: AtomicUsize,
-    locals: Mutex<Vec<Option<crossbeam_deque::Worker<SchedUnit<Task>>>>>,
+    locals: Mutex<Vec<Option<crossbeam_deque::Worker<SchedUnit<G::Task>>>>>,
 }
 
-impl<Task> QueueCore<Task> {
+impl<G: GlobalQueue> QueueCore<G> {
     fn sleep(&self, min_slot_count: usize, reduce_slot: bool, pause: bool) -> (usize, bool) {
         let mut running_info = self.running_info.load(Ordering::Acquire);
         loop {
@@ -515,13 +547,13 @@ impl<Task> QueueCore<Task> {
     }
 }
 
-struct LocalQueue<Task> {
-    local: crossbeam_deque::Worker<SchedUnit<Task>>,
-    core: Arc<QueueCore<Task>>,
+struct LocalQueue<G: GlobalQueue> {
+    local: crossbeam_deque::Worker<SchedUnit<G::Task>>,
+    core: Arc<QueueCore<G>>,
     pos: usize,
 }
 
-impl<Task> LocalQueue<Task> {
+impl<G: GlobalQueue> LocalQueue<G> {
     fn unpark_one(&mut self, agent: &mut SpawnAgent, check_time: Instant) -> (bool, bool) {
         let running_info = self.core.running_info.load(Ordering::SeqCst);
         if is_shutdown(running_info) {
@@ -558,25 +590,25 @@ impl<Task> LocalQueue<Task> {
             slot_count
         );
 
-        let address = &*self.core as *const QueueCore<Task> as usize;
+        let address = &*self.core as *const QueueCore<G> as usize;
         (self.core.unpark_one(address, self.pos), allocated)
     }
 }
 
-struct Queues<Task> {
-    core: Arc<QueueCore<Task>>,
+struct Queues<G: GlobalQueue> {
+    core: Arc<QueueCore<G>>,
 }
 
-impl<Task> Clone for Queues<Task> {
-    fn clone(&self) -> Queues<Task> {
+impl<G: GlobalQueue> Clone for Queues<G> {
+    fn clone(&self) -> Queues<G> {
         Queues {
             core: self.core.clone(),
         }
     }
 }
 
-impl<Task> Queues<Task> {
-    fn acquire_local_queue(&self) -> LocalQueue<Task> {
+impl<G: GlobalQueue> Queues<G> {
+    fn acquire_local_queue(&self) -> LocalQueue<G> {
         let mut locals = self.core.locals.lock().unwrap();
         for (pos, l) in locals.iter_mut().enumerate() {
             if l.is_some() {
@@ -590,7 +622,7 @@ impl<Task> Queues<Task> {
         unreachable!()
     }
 
-    fn release_local_queue(&mut self, q: LocalQueue<Task>) {
+    fn release_local_queue(&mut self, q: LocalQueue<G>) {
         let mut locals = self.core.locals.lock().unwrap();
         assert!(locals[q.pos].replace(q.local).is_none());
     }
@@ -612,21 +644,21 @@ impl<Task> Queues<Task> {
             }
         }
 
-        let address = &*self.core as *const QueueCore<Task> as usize;
+        let address = &*self.core as *const QueueCore<G> as usize;
         self.core.unpark_one(address, self.core.stealers.len())
     }
 
     fn unpark_shutdown(&self) {
-        let address = &*self.core as *const QueueCore<Task> as usize;
+        let address = &*self.core as *const QueueCore<G> as usize;
         unsafe {
             parking_lot_core::unpark_all(address, UnparkToken(self.core.stealers.len() + 1));
         }
     }
 
-    fn push(&self, task: Task) {
+    fn push(&self, task: G::RawTask) {
         let u = SchedUnit::new(task);
         let sched_time = u.sched_time;
-        self.core.global.push(u);
+        self.core.global.push_raw_task(u);
         self.unpark_one(sched_time);
     }
 }
@@ -639,20 +671,23 @@ fn elapsed(start: Instant, end: Instant) -> Duration {
     }
 }
 
-pub struct WorkerThread<R: Runner> {
-    local: LocalQueue<R::Task>,
+pub struct WorkerThread<G, R>
+where
+    G: GlobalQueue,
+    R: Runner<GlobalQueue = G>,
+{
+    local: LocalQueue<G>,
     runner: R,
     agent: SpawnAgent,
     sched_config: SchedConfig,
 }
 
-impl<R: Runner> WorkerThread<R> {
-    fn new(
-        local: LocalQueue<R::Task>,
-        agent: SpawnAgent,
-        runner: R,
-        sched_config: SchedConfig,
-    ) -> WorkerThread<R> {
+impl<G, R> WorkerThread<G, R>
+where
+    G: GlobalQueue,
+    R: Runner<GlobalQueue = G>,
+{
+    fn new(local: LocalQueue<G>, agent: SpawnAgent, runner: R, sched_config: SchedConfig) -> Self {
         WorkerThread {
             local,
             agent,
@@ -701,8 +736,7 @@ impl<R: Runner> WorkerThread<R> {
             };
             let now = Instant::now();
             if elapsed(t.sched_time, now) >= self.sched_config.max_wait_time
-                || is_local
-                    && elapsed(last_spawn_time, now) >= self.sched_config.spawn_backoff
+                || is_local && elapsed(last_spawn_time, now) >= self.sched_config.spawn_backoff
             {
                 let (unparked, allocated) = ctx.local_queue.unpark_one(&mut ctx.agent, now);
                 if unparked {
@@ -730,21 +764,23 @@ struct SchedConfig {
     alloc_slot_backoff: Duration,
 }
 
-pub struct LazyConfig<T> {
+pub struct LazyConfig<G: GlobalQueue> {
     cfg: Config,
-    queues: Queues<T>,
+    queues: Queues<G>,
 }
 
-impl<T: Send> LazyConfig<T> {
-    pub fn name(mut self, name_prefix: impl Into<String>) -> LazyConfig<T> {
+impl<G: GlobalQueue> LazyConfig<G> {
+    pub fn name(mut self, name_prefix: impl Into<String>) -> LazyConfig<G> {
         self.cfg.name_prefix = name_prefix.into();
         self
     }
 
-    pub fn spawn<F>(self, mut factory: F) -> ThreadPool<T>
+    pub fn spawn<F>(self, mut factory: F) -> ThreadPool<G>
     where
+        G: GlobalQueue + Send + Sync + 'static,
+        G::Task: Send + 'static,
         F: RunnerFactory,
-        F::Runner: Runner<Task = T> + Send + 'static,
+        F::Runner: Runner<GlobalQueue = G> + Send + 'static,
     {
         let mut threads = Vec::with_capacity(self.cfg.sched_config.max_thread_count);
         for i in 0..self.cfg.sched_config.max_thread_count {
@@ -841,8 +877,11 @@ impl Config {
         self
     }
 
-    pub fn freeze<T>(&self) -> (Remote<T>, LazyConfig<T>) {
-        let injector = crossbeam_deque::Injector::new();
+    pub fn freeze<G: GlobalQueue>(
+        &self,
+        global_ctor: impl FnOnce() -> G,
+    ) -> (Remote<G>, LazyConfig<G>) {
+        let global = global_ctor();
         assert!(self.sched_config.max_thread_count < SLOTS_BASE >> RUNNING_BASE_SHIFT);
         assert!(self.sched_config.min_thread_count <= self.sched_config.max_thread_count);
         let mut workers = Vec::with_capacity(self.sched_config.max_thread_count);
@@ -857,7 +896,7 @@ impl Config {
         let manager = Arc::new(SpawnManager::new(&self.sched_config));
         let queues = Queues {
             core: Arc::new(QueueCore {
-                global: injector,
+                global,
                 stealers,
                 manager,
                 locals: Mutex::new(workers),
@@ -875,27 +914,32 @@ impl Config {
         )
     }
 
-    pub fn spawn<F>(&self, factory: F) -> ThreadPool<<<F as RunnerFactory>::Runner as Runner>::Task>
+    pub fn spawn<F>(
+        &self,
+        factory: F,
+        global_ctor: impl FnOnce() -> <F::Runner as Runner>::GlobalQueue,
+    ) -> ThreadPool<<F::Runner as Runner>::GlobalQueue>
     where
         F: RunnerFactory,
         F::Runner: Send + 'static,
-        <<F as RunnerFactory>::Runner as Runner>::Task: Send,
+        <F::Runner as Runner>::GlobalQueue: Send + Sync + 'static,
+        <<F::Runner as Runner>::GlobalQueue as GlobalQueue>::Task: Send + 'static,
     {
-        self.freeze().1.spawn(factory)
+        self.freeze(global_ctor).1.spawn(factory)
     }
 }
 
-pub struct ThreadPool<Task> {
-    queues: Queues<Task>,
+pub struct ThreadPool<G: GlobalQueue> {
+    queues: Queues<G>,
     threads: Mutex<Vec<JoinHandle<()>>>,
 }
 
-impl<Task> ThreadPool<Task> {
-    pub fn spawn(&self, t: impl Into<Task>) {
+impl<G: GlobalQueue> ThreadPool<G> {
+    pub fn spawn(&self, t: impl Into<G::RawTask>) {
         self.queues.push(t.into());
     }
 
-    pub fn remote(&self) -> Remote<Task> {
+    pub fn remote(&self) -> Remote<G> {
         Remote {
             queue: self.queues.clone(),
         }
@@ -913,7 +957,7 @@ impl<Task> ThreadPool<Task> {
     }
 }
 
-impl<Task> Drop for ThreadPool<Task> {
+impl<G: GlobalQueue> Drop for ThreadPool<G> {
     fn drop(&mut self) {
         self.shutdown();
     }

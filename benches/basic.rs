@@ -155,15 +155,35 @@ mod cpupool {
 }
 
 mod thread_pool_callback {
-    use chocolates::thread_pool::callback::{Handle, RunnerFactory};
-    use chocolates::thread_pool::Config;
+    use chocolates::thread_pool::callback::{Handle, RunnerFactory, Task};
+    use chocolates::thread_pool::{Config, GlobalQueue};
     use num_cpus;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering::SeqCst;
     use std::sync::{mpsc, Arc};
 
+    use chocolates::thread_pool::SchedUnit;
+    use crossbeam_deque::Steal;
+    struct GQueue(crossbeam_deque::Injector<SchedUnit<Task<GQueue>>>);
+    impl GlobalQueue for GQueue {
+        type RawTask = Task<GQueue>;
+        type Task = Task<GQueue>;
+
+        fn steal_batch_and_pop(
+            &self,
+            local_queue: &crossbeam_deque::Worker<SchedUnit<Self::Task>>,
+        ) -> Steal<SchedUnit<Self::Task>> {
+            crossbeam_deque::Injector::steal_batch_and_pop(&self.0, local_queue)
+        }
+        fn push_raw_task(&self, raw_task: SchedUnit<Self::RawTask>) {
+            self.0.push(raw_task);
+        }
+    }
+
     pub fn spawn_many(b: &mut criterion::Bencher) {
-        let pool = Config::new("test-pool").spawn(RunnerFactory::new());
+        let pool = Config::new("test-pool").spawn(RunnerFactory::new(), || {
+            GQueue(crossbeam_deque::Injector::new())
+        });
 
         let (tx, rx) = mpsc::sync_channel(10);
         let rem = Arc::new(AtomicUsize::new(0));
@@ -187,7 +207,9 @@ mod thread_pool_callback {
     }
 
     pub fn yield_many(b: &mut criterion::Bencher) {
-        let pool = Config::new("yield many").spawn(RunnerFactory::new());
+        let pool = Config::new("test-pool").spawn(RunnerFactory::new(), || {
+            GQueue(crossbeam_deque::Injector::new())
+        });
         let tasks = super::TASKS_PER_CPU * num_cpus::get();
 
         let (tx, rx) = mpsc::sync_channel(tasks);
@@ -197,7 +219,10 @@ mod thread_pool_callback {
                 let mut rem = super::NUM_YIELD;
                 let tx = tx.clone();
 
-                fn sub_rem(c: &mut Handle<'_>, rem: &mut usize, tx: &mpsc::SyncSender<()>) {
+                fn sub_rem<G>(c: &mut Handle<'_, G>, rem: &mut usize, tx: &mpsc::SyncSender<()>)
+                where
+                    G: GlobalQueue<Task = Task<G>, RawTask = Task<G>>,
+                {
                     *rem -= 1;
                     if *rem == 0 {
                         tx.send(()).unwrap();
@@ -226,7 +251,8 @@ mod thread_pool_future {
     use std::sync::{mpsc, Arc};
 
     pub fn spawn_many(b: &mut criterion::Bencher) {
-        let threadpool = Config::new("test-pool").spawn(RunnerFactory::new(4));
+        let threadpool = Config::new("test-pool")
+            .spawn(RunnerFactory::new(4), || crossbeam_deque::Injector::new());
 
         let (tx, rx) = mpsc::sync_channel(10);
         let rem = Arc::new(AtomicUsize::new(0));
@@ -252,7 +278,8 @@ mod thread_pool_future {
     }
 
     pub fn yield_many(b: &mut criterion::Bencher) {
-        let threadpool = Config::new("test-pool").spawn(RunnerFactory::new(4));
+        let threadpool = Config::new("test-pool")
+            .spawn(RunnerFactory::new(4), || crossbeam_deque::Injector::new());
         let tasks = super::TASKS_PER_CPU * num_cpus::get();
 
         let (tx, rx) = mpsc::sync_channel(tasks);
