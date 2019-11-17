@@ -1,4 +1,5 @@
-use super::{GlobalQueue, PoolContext};
+use super::{Config, GlobalQueue, PoolContext, SchedUnit};
+use crossbeam_deque::Steal;
 use std::marker::PhantomData;
 
 pub enum Task<G>
@@ -8,18 +9,6 @@ where
     Once(Box<dyn FnOnce(&mut Handle<'_, G>) + Send>),
     Mut(Box<dyn FnMut(&mut Handle<'_, G>) + Send>),
 }
-
-impl<G> Task<G>
-where
-    G: GlobalQueue<Task = Task<G>, RawTask = Task<G>>,
-{
-    fn erase_type(self) -> TypeErasedTask {
-        unsafe { std::mem::transmute(self) }
-    }
-}
-
-/// Same as `Task<G>` but the type is erased to avoid cyclic type error.
-pub struct TypeErasedTask([u8; 24]);
 
 pub struct Runner<G>
 where
@@ -162,5 +151,43 @@ where
 
     pub fn spawn_mut(&self, t: impl FnMut(&mut Handle<'_, G>) + Send + 'static) {
         self.spawn(Task::Mut(Box::new(t)))
+    }
+}
+
+// For lack of lazy normalization, a wrapper type is needed to avoid cyclic type error.
+
+pub struct SingleQueue(crossbeam_deque::Injector<SchedUnit<Task<SingleQueue>>>);
+
+impl GlobalQueue for SingleQueue {
+    type RawTask = Task<SingleQueue>;
+    type Task = Task<SingleQueue>;
+
+    fn steal_batch_and_pop(
+        &self,
+        local_queue: &crossbeam_deque::Worker<SchedUnit<Self::Task>>,
+    ) -> Steal<SchedUnit<Self::Task>> {
+        crossbeam_deque::Injector::steal_batch_and_pop(&self.0, local_queue)
+    }
+    fn push_raw_task(&self, raw_task: SchedUnit<Self::RawTask>) {
+        self.0.push(raw_task);
+    }
+}
+
+pub struct SimpleThreadPool(super::ThreadPool<SingleQueue>);
+
+impl SimpleThreadPool {
+    pub fn from_config(config: Config) -> Self {
+        let pool = config.spawn(RunnerFactory::new(), || {
+            SingleQueue(crossbeam_deque::Injector::new())
+        });
+        Self(pool)
+    }
+
+    pub fn spawn_once(&self, t: impl FnOnce(&mut Handle<'_, SingleQueue>) + Send + 'static) {
+        self.0.spawn_once(t)
+    }
+
+    pub fn spawn_mut(&self, t: impl FnMut(&mut Handle<'_, SingleQueue>) + Send + 'static) {
+        self.0.spawn_mut(t)
     }
 }
