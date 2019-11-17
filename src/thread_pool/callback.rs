@@ -1,19 +1,50 @@
-use super::PoolContext;
+use super::{PoolContext, SchedUnit, TaskProvider};
 
-pub enum Task {
-    Once(Box<dyn FnOnce(&mut Handle<'_>) + Send>),
-    Mut(Box<dyn FnMut(&mut Handle<'_>) + Send>),
+use static_assertions::assert_eq_size;
+use std::marker::PhantomData;
+
+pub enum Task<P>
+where
+    P: TaskProvider<Task = TypeErasedTask, RawTask = TypeErasedTask>,
+{
+    Once(Box<dyn FnOnce(&mut Handle<'_, P>) + Send>),
+    Mut(Box<dyn FnMut(&mut Handle<'_, P>) + Send>),
 }
 
-pub struct Runner {
+/// Same as `Task<P>` but erased its actual type. This type is created to avoid cyclic type.
+pub struct TypeErasedTask([u8; 24]);
+
+assert_eq_size!(
+    TypeErasedTask,
+    Task<crossbeam_deque::Injector<SchedUnit<TypeErasedTask>>>
+);
+
+impl<P> Task<P>
+where
+    P: TaskProvider<Task = TypeErasedTask, RawTask = TypeErasedTask>,
+{
+    fn erase_type(self) -> TypeErasedTask {
+        unsafe { std::mem::transmute(self) }
+    }
+}
+
+pub struct Runner<P>
+where
+    P: TaskProvider<Task = TypeErasedTask, RawTask = TypeErasedTask>,
+{
     max_inplace_spin: usize,
+    _phantom: PhantomData<P>,
 }
 
-impl super::Runner for Runner {
-    type Task = Task;
+impl<P> super::Runner for Runner<P>
+where
+    P: TaskProvider<Task = TypeErasedTask, RawTask = TypeErasedTask>,
+{
+    type TaskProvider = P;
 
-    fn handle(&mut self, ctx: &mut PoolContext<Task>, mut task: Task) -> bool {
+    fn handle(&mut self, ctx: &mut PoolContext<P>, task: TypeErasedTask) -> bool {
         let mut handle = Handle { ctx, rerun: false };
+        let mut task: Task<P> = unsafe { std::mem::transmute(task) };
         match task {
             Task::Mut(ref mut r) => {
                 let mut tried_times = 0;
@@ -35,58 +66,78 @@ impl super::Runner for Runner {
                 return true;
             }
         }
-        ctx.spawn(task);
+        ctx.spawn(task.erase_type());
         false
     }
 }
 
-pub struct Handle<'a> {
-    ctx: &'a mut PoolContext<Task>,
+pub struct Handle<'a, P>
+where
+    P: TaskProvider<Task = TypeErasedTask, RawTask = TypeErasedTask>,
+{
+    ctx: &'a mut PoolContext<P>,
     rerun: bool,
 }
 
-impl<'a> Handle<'a> {
-    pub fn spawn_once(&mut self, t: impl FnOnce(&mut Handle<'_>) + Send + 'static) {
-        self.ctx.spawn(Task::Once(Box::new(t)));
+impl<'a, P: TaskProvider> Handle<'a, P>
+where
+    P: TaskProvider<Task = TypeErasedTask, RawTask = TypeErasedTask>,
+{
+    pub fn spawn_once(&mut self, t: impl FnOnce(&mut Handle<'_, P>) + Send + 'static) {
+        self.ctx.spawn(Task::Once(Box::new(t)).erase_type());
     }
 
-    pub fn spawn_mut(&mut self, t: impl FnMut(&mut Handle<'_>) + Send + 'static) {
-        self.ctx.spawn(Task::Mut(Box::new(t)));
+    pub fn spawn_mut(&mut self, t: impl FnMut(&mut Handle<'_, P>) + Send + 'static) {
+        self.ctx.spawn(Task::Mut(Box::new(t)).erase_type());
     }
 
     pub fn rerun(&mut self) {
         self.rerun = true;
     }
 
-    pub fn to_owned(&self) -> Remote {
+    pub fn to_owned(&self) -> Remote<P> {
         Remote {
             remote: self.ctx.remote(),
         }
     }
 }
 
-pub struct Remote {
-    remote: super::Remote<Task>,
+pub struct Remote<P>
+where
+    P: TaskProvider<Task = TypeErasedTask>,
+{
+    remote: super::Remote<P>,
 }
 
-impl Remote {
-    pub fn spawn_once(&self, t: impl FnOnce(&mut Handle<'_>) + Send + 'static) {
-        self.remote.spawn(Task::Once(Box::new(t)));
+impl<P> Remote<P>
+where
+    P: TaskProvider<Task = TypeErasedTask, RawTask = TypeErasedTask>,
+{
+    pub fn spawn_once(&self, t: impl FnOnce(&mut Handle<'_, P>) + Send + 'static) {
+        self.remote.spawn(Task::Once(Box::new(t)).erase_type());
     }
 
-    pub fn spawn_mut(&self, t: impl FnMut(&mut Handle<'_>) + Send + 'static) {
-        self.remote.spawn(Task::Mut(Box::new(t)))
+    pub fn spawn_mut(&self, t: impl FnMut(&mut Handle<'_, P>) + Send + 'static) {
+        self.remote.spawn(Task::Mut(Box::new(t)).erase_type())
     }
 }
 
-pub struct RunnerFactory {
+pub struct RunnerFactory<P>
+where
+    P: TaskProvider<Task = TypeErasedTask, RawTask = TypeErasedTask>,
+{
     max_inplace_spin: usize,
+    _phantom: PhantomData<P>,
 }
 
-impl RunnerFactory {
-    pub fn new() -> RunnerFactory {
+impl<P> RunnerFactory<P>
+where
+    P: TaskProvider<Task = TypeErasedTask, RawTask = TypeErasedTask>,
+{
+    pub fn new() -> RunnerFactory<P> {
         RunnerFactory {
             max_inplace_spin: 4,
+            _phantom: PhantomData,
         }
     }
 
@@ -95,22 +146,29 @@ impl RunnerFactory {
     }
 }
 
-impl super::RunnerFactory for RunnerFactory {
-    type Runner = Runner;
+impl<P> super::RunnerFactory for RunnerFactory<P>
+where
+    P: TaskProvider<Task = TypeErasedTask, RawTask = TypeErasedTask>,
+{
+    type Runner = Runner<P>;
 
-    fn produce(&mut self) -> Runner {
+    fn produce(&mut self) -> Runner<P> {
         Runner {
             max_inplace_spin: self.max_inplace_spin,
+            _phantom: PhantomData,
         }
     }
 }
 
-impl super::ThreadPool<Task> {
-    pub fn spawn_once(&self, t: impl FnOnce(&mut Handle<'_>) + Send + 'static) {
-        self.spawn(Task::Once(Box::new(t)));
+impl<P> super::ThreadPool<P>
+where
+    P: TaskProvider<Task = TypeErasedTask, RawTask = TypeErasedTask>,
+{
+    pub fn spawn_once(&self, t: impl FnOnce(&mut Handle<'_, P>) + Send + 'static) {
+        self.spawn(Task::Once(Box::new(t)).erase_type());
     }
 
-    pub fn spawn_mut(&self, t: impl FnMut(&mut Handle<'_>) + Send + 'static) {
-        self.spawn(Task::Mut(Box::new(t)))
+    pub fn spawn_mut(&self, t: impl FnMut(&mut Handle<'_, P>) + Send + 'static) {
+        self.spawn(Task::Mut(Box::new(t)).erase_type())
     }
 }

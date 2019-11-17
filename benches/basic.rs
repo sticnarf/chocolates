@@ -155,15 +155,16 @@ mod cpupool {
 }
 
 mod thread_pool_callback {
-    use chocolates::thread_pool::callback::{Handle, RunnerFactory};
-    use chocolates::thread_pool::Config;
+    use chocolates::thread_pool::callback::{Handle, RunnerFactory, TypeErasedTask};
+    use chocolates::thread_pool::{Config, TaskProvider};
     use num_cpus;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering::SeqCst;
     use std::sync::{mpsc, Arc};
 
     pub fn spawn_many(b: &mut criterion::Bencher) {
-        let pool = Config::new("test-pool").spawn(RunnerFactory::new());
+        let pool = Config::new("test-pool")
+            .spawn(RunnerFactory::new(), || crossbeam_deque::Injector::new());
 
         let (tx, rx) = mpsc::sync_channel(10);
         let rem = Arc::new(AtomicUsize::new(0));
@@ -187,7 +188,8 @@ mod thread_pool_callback {
     }
 
     pub fn yield_many(b: &mut criterion::Bencher) {
-        let pool = Config::new("yield many").spawn(RunnerFactory::new());
+        let pool = Config::new("yield many")
+            .spawn(RunnerFactory::new(), || crossbeam_deque::Injector::new());
         let tasks = super::TASKS_PER_CPU * num_cpus::get();
 
         let (tx, rx) = mpsc::sync_channel(tasks);
@@ -197,7 +199,10 @@ mod thread_pool_callback {
                 let mut rem = super::NUM_YIELD;
                 let tx = tx.clone();
 
-                fn sub_rem(c: &mut Handle<'_>, rem: &mut usize, tx: &mpsc::SyncSender<()>) {
+                fn sub_rem<P>(c: &mut Handle<'_, P>, rem: &mut usize, tx: &mpsc::SyncSender<()>)
+                where
+                    P: TaskProvider<Task = TypeErasedTask, RawTask = TypeErasedTask>,
+                {
                     *rem -= 1;
                     if *rem == 0 {
                         tx.send(()).unwrap();
@@ -226,7 +231,8 @@ mod thread_pool_future {
     use std::sync::{mpsc, Arc};
 
     pub fn spawn_many(b: &mut criterion::Bencher) {
-        let threadpool = Config::new("test-pool").spawn(RunnerFactory::new(4));
+        let threadpool = Config::new("test-pool")
+            .spawn(RunnerFactory::new(4), || crossbeam_deque::Injector::new());
 
         let (tx, rx) = mpsc::sync_channel(10);
         let rem = Arc::new(AtomicUsize::new(0));
@@ -252,7 +258,8 @@ mod thread_pool_future {
     }
 
     pub fn yield_many(b: &mut criterion::Bencher) {
-        let threadpool = Config::new("test-pool").spawn(RunnerFactory::new(4));
+        let threadpool = Config::new("test-pool")
+            .spawn(RunnerFactory::new(4), || crossbeam_deque::Injector::new());
         let tasks = super::TASKS_PER_CPU * num_cpus::get();
 
         let (tx, rx) = mpsc::sync_channel(tasks);

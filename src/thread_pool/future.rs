@@ -1,42 +1,63 @@
-use super::PoolContext;
+use super::{PoolContext, TaskProvider};
 use futures::executor::{self, Notify, Spawn};
 use futures::future::{ExecuteError, Executor};
 use futures::sync::oneshot;
 use futures::{Async, Future};
 use std::cell::UnsafeCell;
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::{mem, ptr};
 
 pub use futures::sync::oneshot::SpawnHandle;
 
-pub struct Runner {
+pub struct Runner<P>
+where
+    P: TaskProvider<Task = Arc<TaskUnit>, RawTask = Arc<TaskUnit>> + Send + Sync + 'static,
+{
     max_inplace_spin: usize,
-    notifier: Option<Arc<ThreadPoolNotify>>,
+    notifier: Option<Arc<ThreadPoolNotify<P>>>,
 }
 
-pub struct RunnerFactory {
+pub struct RunnerFactory<P>
+where
+    P: TaskProvider<Task = Arc<TaskUnit>, RawTask = Arc<TaskUnit>> + Send + Sync + 'static,
+{
     max_inplace_spin: usize,
+    _phantom: PhantomData<P>,
 }
 
-impl RunnerFactory {
-    pub fn new(max_inplace_spin: usize) -> RunnerFactory {
-        RunnerFactory { max_inplace_spin }
-    }
-}
-
-impl Default for RunnerFactory {
-    fn default() -> RunnerFactory {
+impl<P> RunnerFactory<P>
+where
+    P: TaskProvider<Task = Arc<TaskUnit>, RawTask = Arc<TaskUnit>> + Send + Sync + 'static,
+{
+    pub fn new(max_inplace_spin: usize) -> RunnerFactory<P> {
         RunnerFactory {
-            max_inplace_spin: 4,
+            max_inplace_spin,
+            _phantom: PhantomData,
         }
     }
 }
 
-impl super::RunnerFactory for RunnerFactory {
-    type Runner = Runner;
+impl<P> Default for RunnerFactory<P>
+where
+    P: TaskProvider<Task = Arc<TaskUnit>, RawTask = Arc<TaskUnit>> + Send + Sync + 'static,
+{
+    fn default() -> RunnerFactory<P> {
+        RunnerFactory {
+            max_inplace_spin: 4,
+            _phantom: PhantomData,
+        }
+    }
+}
 
-    fn produce(&mut self) -> Runner {
+impl<P> super::RunnerFactory for RunnerFactory<P>
+where
+    P: TaskProvider<Task = Arc<TaskUnit>, RawTask = Arc<TaskUnit>> + Send + Sync + 'static,
+{
+    type Runner = Runner<P>;
+
+    fn produce(&mut self) -> Runner<P> {
         Runner {
             max_inplace_spin: self.max_inplace_spin,
             notifier: None,
@@ -45,15 +66,21 @@ impl super::RunnerFactory for RunnerFactory {
 }
 
 thread_local! {
-    static LOCAL_WAKER: UnsafeCell<*mut PoolContext<Arc<TaskUnit>>> = UnsafeCell::new(ptr::null_mut());
+    // static LOCAL_WAKER: UnsafeCell<*mut PoolContext<Arc<TaskUnit>>> = UnsafeCell::new(ptr::null_mut());
+    static LOCAL_WAKER: UnsafeCell<*mut ()> = UnsafeCell::new(ptr::null_mut());
 }
 
-#[derive(Clone)]
-pub struct Sender {
-    remote: super::Remote<Arc<TaskUnit>>,
+pub struct Sender<P>
+where
+    P: TaskProvider<Task = Arc<TaskUnit>, RawTask = Arc<TaskUnit>> + Send + Sync + 'static,
+{
+    remote: super::Remote<P>,
 }
 
-impl Sender {
+impl<P> Sender<P>
+where
+    P: TaskProvider<Task = Arc<TaskUnit>, RawTask = Arc<TaskUnit>> + Send + Sync + 'static,
+{
     pub fn spawn(&self, f: impl Future<Item = (), Error = ()> + Send + 'static) {
         self.spawn_task(Arc::new(TaskUnit::new(f)))
     }
@@ -73,17 +100,34 @@ impl Sender {
             if ptr.is_null() {
                 self.remote.spawn(task)
             } else {
-                unsafe { &mut *ptr }.spawn(task)
+                unsafe { (*(ptr as *mut PoolContext<P>)).spawn(task) }
             }
         })
     }
 }
 
-pub struct ThreadPoolNotify {
-    sender: Sender,
+impl<P> Clone for Sender<P>
+where
+    P: TaskProvider<Task = Arc<TaskUnit>, RawTask = Arc<TaskUnit>> + Send + Sync + 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            remote: self.remote.clone(),
+        }
+    }
 }
 
-impl Notify for ThreadPoolNotify {
+pub struct ThreadPoolNotify<P>
+where
+    P: TaskProvider<Task = Arc<TaskUnit>, RawTask = Arc<TaskUnit>> + Send + Sync + 'static,
+{
+    sender: Sender<P>,
+}
+
+impl<P> Notify for ThreadPoolNotify<P>
+where
+    P: TaskProvider<Task = Arc<TaskUnit>, RawTask = Arc<TaskUnit>> + Send + Sync + 'static,
+{
     fn notify(&self, id: usize) {
         let task = unsafe { Arc::from_raw(id as *mut TaskUnit) };
         if !task.mark_scheduled() {
@@ -127,9 +171,10 @@ impl TaskUnit {
     }
 }
 
-pub type FutureThreadPool = super::ThreadPool<Arc<TaskUnit>>;
-
-impl FutureThreadPool {
+impl<P> super::ThreadPool<P>
+where
+    P: TaskProvider<Task = Arc<TaskUnit>, RawTask = Arc<TaskUnit>> + Send + Sync + 'static,
+{
     pub fn spawn_future<F: Future<Item = (), Error = ()> + Send + 'static>(&self, f: F) {
         let t = Arc::new(TaskUnit::new(f));
         self.spawn(t);
@@ -144,7 +189,7 @@ impl FutureThreadPool {
         oneshot::spawn(f, self)
     }
 
-    pub fn sender(&self) -> Sender {
+    pub fn sender(&self) -> Sender<P> {
         Sender {
             remote: self.remote(),
         }
@@ -201,14 +246,17 @@ impl TaskUnit {
     }
 }
 
-impl super::Runner for Runner {
-    type Task = Arc<TaskUnit>;
+impl<P> super::Runner for Runner<P>
+where
+    P: TaskProvider<Task = Arc<TaskUnit>, RawTask = Arc<TaskUnit>> + Send + Sync + 'static,
+{
+    type TaskProvider = P;
 
-    fn start(&mut self, ctx: &mut PoolContext<Self::Task>) {
+    fn start(&mut self, ctx: &mut PoolContext<P>) {
         LOCAL_WAKER.with(|w| {
             let waker = unsafe { &mut *w.get() };
             assert!((*waker).is_null());
-            *waker = ctx;
+            *waker = ctx as *mut _ as *mut ();
         });
         self.notifier = Some(Arc::new(ThreadPoolNotify {
             sender: Sender {
@@ -217,7 +265,7 @@ impl super::Runner for Runner {
         }));
     }
 
-    fn handle(&mut self, ctx: &mut PoolContext<Self::Task>, task: Self::Task) -> bool {
+    fn handle(&mut self, ctx: &mut PoolContext<P>, task: Arc<TaskUnit>) -> bool {
         let mut tried_times = 1;
         let id = &*task as *const TaskUnit as usize;
         let spawn = unsafe { &mut *task.task.get() }.as_mut().unwrap();
@@ -246,7 +294,7 @@ impl super::Runner for Runner {
         }
     }
 
-    fn end(&mut self, _: &PoolContext<Self::Task>) {
+    fn end(&mut self, _: &PoolContext<P>) {
         LOCAL_WAKER.with(|w| {
             let waker = unsafe { &mut *w.get() };
             assert!(!(*waker).is_null());
@@ -256,9 +304,10 @@ impl super::Runner for Runner {
     }
 }
 
-impl<F> Executor<F> for Sender
+impl<F, P> Executor<F> for Sender<P>
 where
     F: Future<Item = (), Error = ()> + Send + 'static,
+    P: TaskProvider<Task = Arc<TaskUnit>, RawTask = Arc<TaskUnit>> + Send + Sync + 'static,
 {
     fn execute(&self, future: F) -> Result<(), ExecuteError<F>> {
         self.spawn(future);
@@ -267,9 +316,10 @@ where
     }
 }
 
-impl<F> Executor<F> for FutureThreadPool
+impl<F, P> Executor<F> for super::ThreadPool<P>
 where
     F: Future<Item = (), Error = ()> + Send + 'static,
+    P: TaskProvider<Task = Arc<TaskUnit>, RawTask = Arc<TaskUnit>> + Send + Sync + 'static,
 {
     fn execute(&self, future: F) -> Result<(), ExecuteError<F>> {
         self.spawn_future(future);

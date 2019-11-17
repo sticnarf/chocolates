@@ -9,6 +9,7 @@ num_cpus = "1.0"
 crossbeam-deque = "0.7"
 parking_lot_core = "0.6"
 futures = "0.1"
+static_assertions = "1.1"
 
 [dev-dependencies]
 tokio-threadpool = { version = "0.1" }
@@ -35,4 +36,5 @@ harness = false
 
 [profile.bench]
 debug = true
+lto = true
 codegen-units = 1
