@@ -13,7 +13,7 @@ pub use futures::sync::oneshot::SpawnHandle;
 
 pub struct Runner<G>
 where
-    G: GlobalQueue<Task = Arc<TaskUnit>, RawTask = Arc<TaskUnit>> + Send + Sync + 'static,
+    G: GlobalQueue<Task = Arc<TaskUnit>> + Send + Sync + 'static,
 {
     max_inplace_spin: usize,
     notifier: Option<Arc<ThreadPoolNotify<G>>>,
@@ -22,7 +22,7 @@ where
 
 pub struct RunnerFactory<G>
 where
-    G: GlobalQueue<Task = Arc<TaskUnit>, RawTask = Arc<TaskUnit>> + Send + Sync + 'static,
+    G: GlobalQueue<Task = Arc<TaskUnit>> + Send + Sync + 'static,
 {
     max_inplace_spin: usize,
     _phantom: PhantomData<G>,
@@ -30,7 +30,7 @@ where
 
 impl<G> RunnerFactory<G>
 where
-    G: GlobalQueue<Task = Arc<TaskUnit>, RawTask = Arc<TaskUnit>> + Send + Sync + 'static,
+    G: GlobalQueue<Task = Arc<TaskUnit>> + Send + Sync + 'static,
 {
     pub fn new(max_inplace_spin: usize) -> Self {
         RunnerFactory {
@@ -42,7 +42,7 @@ where
 
 impl<G> Default for RunnerFactory<G>
 where
-    G: GlobalQueue<Task = Arc<TaskUnit>, RawTask = Arc<TaskUnit>> + Send + Sync + 'static,
+    G: GlobalQueue<Task = Arc<TaskUnit>> + Send + Sync + 'static,
 {
     fn default() -> Self {
         Self {
@@ -54,7 +54,7 @@ where
 
 impl<G> super::RunnerFactory for RunnerFactory<G>
 where
-    G: GlobalQueue<Task = Arc<TaskUnit>, RawTask = Arc<TaskUnit>> + Send + Sync + 'static,
+    G: GlobalQueue<Task = Arc<TaskUnit>> + Send + Sync + 'static,
 {
     type Runner = Runner<G>;
 
@@ -73,14 +73,14 @@ thread_local! {
 
 pub struct Sender<G>
 where
-    G: GlobalQueue<Task = Arc<TaskUnit>, RawTask = Arc<TaskUnit>> + Send + Sync + 'static,
+    G: GlobalQueue<Task = Arc<TaskUnit>> + Send + Sync + 'static,
 {
     remote: super::Remote<G>,
 }
 
 impl<G> Sender<G>
 where
-    G: GlobalQueue<Task = Arc<TaskUnit>, RawTask = Arc<TaskUnit>> + Send + Sync + 'static,
+    G: GlobalQueue<Task = Arc<TaskUnit>> + Send + Sync + 'static,
 {
     pub fn spawn(&self, f: impl Future<Item = (), Error = ()> + Send + 'static) {
         self.spawn_task(Arc::new(TaskUnit::new(f)))
@@ -109,7 +109,7 @@ where
 
 impl<G> Clone for Sender<G>
 where
-    G: GlobalQueue<Task = Arc<TaskUnit>, RawTask = Arc<TaskUnit>> + Send + Sync + 'static,
+    G: GlobalQueue<Task = Arc<TaskUnit>> + Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
         Sender {
@@ -120,14 +120,14 @@ where
 
 pub struct ThreadPoolNotify<G>
 where
-    G: GlobalQueue<Task = Arc<TaskUnit>, RawTask = Arc<TaskUnit>> + Send + Sync + 'static,
+    G: GlobalQueue<Task = Arc<TaskUnit>> + Send + Sync + 'static,
 {
     sender: Sender<G>,
 }
 
 impl<G> Notify for ThreadPoolNotify<G>
 where
-    G: GlobalQueue<Task = Arc<TaskUnit>, RawTask = Arc<TaskUnit>> + Send + Sync + 'static,
+    G: GlobalQueue<Task = Arc<TaskUnit>> + Send + Sync + 'static,
 {
     fn notify(&self, id: usize) {
         let task = unsafe { Arc::from_raw(id as *mut TaskUnit) };
@@ -176,7 +176,7 @@ pub type FutureThreadPool<G> = super::ThreadPool<G>;
 
 impl<G> FutureThreadPool<G>
 where
-    G: GlobalQueue<Task = Arc<TaskUnit>, RawTask = Arc<TaskUnit>> + Send + Sync + 'static,
+    G: GlobalQueue<Task = Arc<TaskUnit>> + Send + Sync + 'static,
 {
     pub fn spawn_future<F: Future<Item = (), Error = ()> + Send + 'static>(&self, f: F) {
         let t = Arc::new(TaskUnit::new(f));
@@ -251,7 +251,7 @@ impl TaskUnit {
 
 impl<G> super::Runner for Runner<G>
 where
-    G: GlobalQueue<Task = Arc<TaskUnit>, RawTask = Arc<TaskUnit>> + Send + Sync + 'static,
+    G: GlobalQueue<Task = Arc<TaskUnit>> + Send + Sync + 'static,
 {
     type GlobalQueue = G;
 
@@ -310,7 +310,7 @@ where
 impl<F, G> Executor<F> for Sender<G>
 where
     F: Future<Item = (), Error = ()> + Send + 'static,
-    G: GlobalQueue<Task = Arc<TaskUnit>, RawTask = Arc<TaskUnit>> + Send + Sync + 'static,
+    G: GlobalQueue<Task = Arc<TaskUnit>> + Send + Sync + 'static,
 {
     fn execute(&self, future: F) -> Result<(), ExecuteError<F>> {
         self.spawn(future);
@@ -322,7 +322,7 @@ where
 impl<F, G> Executor<F> for FutureThreadPool<G>
 where
     F: Future<Item = (), Error = ()> + Send + 'static,
-    G: GlobalQueue<Task = Arc<TaskUnit>, RawTask = Arc<TaskUnit>> + Send + Sync + 'static,
+    G: GlobalQueue<Task = Arc<TaskUnit>> + Send + Sync + 'static,
 {
     fn execute(&self, future: F) -> Result<(), ExecuteError<F>> {
         self.spawn_future(future);

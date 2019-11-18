@@ -9,11 +9,21 @@ num_cpus = "1.0"
 crossbeam-deque = "0.7"
 parking_lot_core = "0.6"
 futures = "0.1"
+lazy_static = "1.4.0"
+init_with = "1.1.0"
+dashmap = "1.2.0"
+crossbeam-epoch = "0.8.0"
+futures-timer = "2.0"
+rand = "0.7"
+
+[dependencies.prometheus]
+git = "https://github.com/pingcap/rust-prometheus.git"
+rev = "b668f3911d6569de2e1e8b2672fccec1cc8298be"
+features = ["nightly", "push", "process"]
 
 [dev-dependencies]
 tokio-threadpool = { version = "0.1" }
 futures-cpupool = "0.1"
-rand = "0.6"
 threadpool = "1.0"
 criterion = "0.2"
 

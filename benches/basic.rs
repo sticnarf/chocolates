@@ -199,7 +199,7 @@ mod thread_pool_callback {
 
                 fn sub_rem<G>(c: &mut Handle<'_, G>, rem: &mut usize, tx: &mpsc::SyncSender<()>)
                 where
-                    G: GlobalQueue<Task = Task<G>, RawTask = Task<G>>,
+                    G: GlobalQueue<Task = Task<G>>,
                 {
                     *rem -= 1;
                     if *rem == 0 {

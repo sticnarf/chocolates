@@ -80,7 +80,7 @@ mod thread_pool_callback {
 
         fn spawn<G>(c: &mut Handle<'_, G>, res_tx: mpsc::Sender<()>, n: usize)
         where
-            G: GlobalQueue<Task = Task<G>, RawTask = Task<G>>,
+            G: GlobalQueue<Task = Task<G>>,
         {
             if n == 0 {
                 res_tx.send(()).unwrap();
@@ -113,7 +113,7 @@ mod thread_pool_future {
 
         fn spawn<G>(pool_tx: Sender<G>, res_tx: mpsc::Sender<()>, n: usize)
         where
-            G: GlobalQueue<Task = Arc<TaskUnit>, RawTask = Arc<TaskUnit>> + Send + Sync + 'static,
+            G: GlobalQueue<Task = Arc<TaskUnit>> + Send + Sync + 'static,
         {
             if n == 0 {
                 res_tx.send(()).unwrap();

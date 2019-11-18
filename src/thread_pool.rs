@@ -1,5 +1,6 @@
 pub mod callback;
 pub mod future;
+pub mod global_queue;
 
 use crossbeam_deque::Steal;
 use parking_lot_core::{FilterOp, ParkResult, ParkToken, UnparkToken};
@@ -8,6 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::{Builder, JoinHandle};
 use std::time::{Duration, Instant};
 use std::{mem, usize};
+
+pub use global_queue::GlobalQueue;
 
 const SHUTDOWN_BIT: usize = 0x01;
 const RUNNING_BASE_SHIFT: usize = 1;
@@ -274,36 +277,8 @@ impl<G: GlobalQueue> Clone for Remote<G> {
 }
 
 impl<G: GlobalQueue> Remote<G> {
-    pub fn spawn(&self, t: impl Into<G::RawTask>) {
+    pub fn spawn(&self, t: impl Into<G::Task>) {
         self.queue.push(t.into());
-    }
-}
-
-pub trait GlobalQueue {
-    type RawTask;
-    type Task;
-
-    fn steal_batch_and_pop(
-        &self,
-        local_queue: &crossbeam_deque::Worker<SchedUnit<Self::Task>>,
-    ) -> Steal<SchedUnit<Self::Task>>;
-
-    fn push_raw_task(&self, raw_task: SchedUnit<Self::RawTask>);
-}
-
-impl<Task> GlobalQueue for crossbeam_deque::Injector<SchedUnit<Task>> {
-    type RawTask = Task;
-    type Task = Task;
-
-    fn steal_batch_and_pop(
-        &self,
-        local_queue: &crossbeam_deque::Worker<SchedUnit<Self::Task>>,
-    ) -> Steal<SchedUnit<Self::Task>> {
-        crossbeam_deque::Injector::steal_batch_and_pop(&self, local_queue)
-    }
-
-    fn push_raw_task(&self, raw_task: SchedUnit<Self::RawTask>) {
-        self.push(raw_task);
     }
 }
 
@@ -655,10 +630,10 @@ impl<G: GlobalQueue> Queues<G> {
         }
     }
 
-    fn push(&self, task: G::RawTask) {
+    fn push(&self, task: G::Task) {
         let u = SchedUnit::new(task);
         let sched_time = u.sched_time;
-        self.core.global.push_raw_task(u);
+        self.core.global.push(u);
         self.unpark_one(sched_time);
     }
 }
@@ -935,7 +910,7 @@ pub struct ThreadPool<G: GlobalQueue> {
 }
 
 impl<G: GlobalQueue> ThreadPool<G> {
-    pub fn spawn(&self, t: impl Into<G::RawTask>) {
+    pub fn spawn(&self, t: impl Into<G::Task>) {
         self.queues.push(t.into());
     }
 
