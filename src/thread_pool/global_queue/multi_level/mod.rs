@@ -6,7 +6,6 @@ use stats::{TaskElapsed, TaskElapsedMap};
 use crossbeam_deque::{Injector, Steal};
 use init_with::InitWith;
 use rand::prelude::*;
-use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::SeqCst};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,6 +24,12 @@ pub struct MultiLevelTask<Task> {
     elapsed: TaskElapsed,
     level: u8,
     fixed_level: Option<u8>,
+}
+
+impl<Task> AsMut<Task> for MultiLevelTask<Task> {
+    fn as_mut(&mut self) -> &mut Task {
+        &mut self.task
+    }
 }
 
 impl<Task> MultiLevelQueue<Task> {

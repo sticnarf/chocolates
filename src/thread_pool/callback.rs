@@ -72,16 +72,8 @@ where
 
 impl<'a, G> Handle<'a, G>
 where
-    G: GlobalQueue<Task = Task<G>>,
+    G: GlobalQueue,
 {
-    pub fn spawn_once(&mut self, t: impl FnOnce(&mut Handle<'_, G>) + Send + 'static) {
-        self.ctx.spawn(Task::Once(Some(Box::new(t))));
-    }
-
-    pub fn spawn_mut(&mut self, t: impl FnMut(&mut Handle<'_, G>) + Send + 'static) {
-        self.ctx.spawn(Task::Mut(Box::new(t)));
-    }
-
     pub fn rerun(&mut self) {
         self.rerun = true;
     }
@@ -90,6 +82,19 @@ where
         Remote {
             remote: self.ctx.remote(),
         }
+    }
+}
+
+impl<'a, G> Handle<'a, G>
+where
+    G: GlobalQueue<Task = Task<G>>,
+{
+    pub fn spawn_once(&mut self, t: impl FnOnce(&mut Handle<'_, G>) + Send + 'static) {
+        self.ctx.spawn(Task::Once(Some(Box::new(t))));
+    }
+
+    pub fn spawn_mut(&mut self, t: impl FnMut(&mut Handle<'_, G>) + Send + 'static) {
+        self.ctx.spawn(Task::Mut(Box::new(t)));
     }
 }
 
@@ -152,19 +157,8 @@ where
     }
 }
 
-impl<G> super::ThreadPool<G>
-where
-    G: GlobalQueue<Task = Task<G>>,
-{
-    pub fn spawn_once(&self, t: impl FnOnce(&mut Handle<'_, G>) + Send + 'static) {
-        self.spawn(Task::Once(Some(Box::new(t))));
-    }
-
-    pub fn spawn_mut(&self, t: impl FnMut(&mut Handle<'_, G>) + Send + 'static) {
-        self.spawn(Task::Mut(Box::new(t)))
-    }
-}
-
+// Thread pool with only one global queue.
+//
 // For lack of lazy normalization, a wrapper type is needed to avoid cyclic type error.
 
 pub struct SingleQueue(crossbeam_deque::Injector<SchedUnit<Task<SingleQueue>>>);
@@ -194,10 +188,65 @@ impl SimpleThreadPool {
     }
 
     pub fn spawn_once(&self, t: impl FnOnce(&mut Handle<'_, SingleQueue>) + Send + 'static) {
-        self.0.spawn_once(t)
+        self.0.spawn(Task::Once(Some(Box::new(t))))
     }
 
     pub fn spawn_mut(&self, t: impl FnMut(&mut Handle<'_, SingleQueue>) + Send + 'static) {
-        self.0.spawn_mut(t)
+        self.0.spawn(Task::Mut(Box::new(t)))
+    }
+}
+
+// Thread pool with multi-level queues.
+//
+// For lack of lazy normalization, a wrapper type is needed to avoid cyclic type error.
+
+use crate::thread_pool::global_queue::multi_level;
+
+pub struct MultiLevelQueue(multi_level::MultiLevelQueue<Task<MultiLevelQueue>>);
+
+impl GlobalQueue for MultiLevelQueue {
+    type Task = multi_level::MultiLevelTask<Task<MultiLevelQueue>>;
+
+    fn steal_batch_and_pop(
+        &self,
+        local_queue: &crossbeam_deque::Worker<SchedUnit<Self::Task>>,
+    ) -> Steal<SchedUnit<Self::Task>> {
+        self.0.steal_batch_and_pop(local_queue)
+    }
+    fn push(&self, task: SchedUnit<Self::Task>) {
+        self.0.push(task);
+    }
+}
+
+pub struct MultiLevelThreadPool(super::ThreadPool<MultiLevelQueue>);
+
+impl MultiLevelThreadPool {
+    pub fn from_config(config: Config) -> Self {
+        let pool = config.spawn(RunnerFactory::new(), || {
+            MultiLevelQueue(multi_level::MultiLevelQueue::new())
+        });
+        Self(pool)
+    }
+
+    pub fn spawn_once(
+        &self,
+        t: impl FnOnce(&mut Handle<'_, MultiLevelQueue>) + Send + 'static,
+        task_id: u64,
+        fixed_level: Option<u8>,
+    ) {
+        let global = &self.0.global_queue().0;
+        let task = global.create_task(Task::Once(Some(Box::new(t))), task_id, fixed_level);
+        self.0.spawn(task)
+    }
+
+    pub fn spawn_mut(
+        &self,
+        t: impl FnMut(&mut Handle<'_, MultiLevelQueue>) + Send + 'static,
+        task_id: u64,
+        fixed_level: Option<u8>,
+    ) {
+        let global = &self.0.global_queue().0;
+        let task = global.create_task(Task::Mut(Box::new(t)), task_id, fixed_level);
+        self.0.spawn(task);
     }
 }

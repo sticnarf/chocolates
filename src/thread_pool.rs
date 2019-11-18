@@ -920,6 +920,10 @@ impl<G: GlobalQueue> ThreadPool<G> {
         }
     }
 
+    pub fn global_queue(&self) -> &G {
+        &self.queues.core.global
+    }
+
     pub fn shutdown(&self) {
         self.queues.core.shutdown();
         let mut threads = mem::replace(&mut *self.threads.lock().unwrap(), Vec::new());
