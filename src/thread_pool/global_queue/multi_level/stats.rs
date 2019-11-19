@@ -10,7 +10,18 @@ use std::time::Duration;
 
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(20);
 
-pub type TaskElapsed = Arc<AtomicU64>;
+#[derive(Clone, Default)]
+pub struct TaskElapsed(Arc<AtomicU64>);
+
+impl TaskElapsed {
+    pub fn get(&self) -> Duration {
+        Duration::from_micros(self.0.load(Ordering::SeqCst))
+    }
+
+    pub fn inc_by(&self, t: Duration) {
+        self.0.fetch_add(t.as_micros() as u64, Ordering::SeqCst);
+    }
+}
 
 #[derive(Clone)]
 pub struct TaskElapsedMap {

@@ -14,7 +14,7 @@ const LEVEL_NUM: usize = 3;
 
 pub struct MultiLevelQueue<Task> {
     injectors: Arc<[Injector<SchedUnit<MultiLevelTask<Task>>>; LEVEL_NUM]>,
-    level_stats: LevelStats,
+    level_elapsed: LevelElapsed,
     task_elapsed_map: TaskElapsedMap,
     level_ratio: LevelRatio,
 }
@@ -40,7 +40,7 @@ impl<Task> MultiLevelQueue<Task> {
                     Injector::new()
                 }),
             ),
-            level_stats: LevelStats::default(),
+            level_elapsed: LevelElapsed::default(),
             task_elapsed_map: TaskElapsedMap::new(),
             level_ratio: LevelRatio::default(),
         }
@@ -53,7 +53,7 @@ impl<Task> MultiLevelQueue<Task> {
         fixed_level: Option<u8>,
     ) -> MultiLevelTask<Task> {
         let elapsed = self.task_elapsed_map.get_elapsed(task_id);
-        let level = fixed_level.unwrap_or_else(|| self.expected_level(elapsed.load(SeqCst)));
+        let level = fixed_level.unwrap_or_else(|| self.expected_level(elapsed.get()));
         MultiLevelTask {
             task,
             elapsed,
@@ -62,8 +62,8 @@ impl<Task> MultiLevelQueue<Task> {
         }
     }
 
-    fn expected_level(&self, elapsed: u64) -> u8 {
-        match elapsed {
+    fn expected_level(&self, elapsed: Duration) -> u8 {
+        match elapsed.as_micros() {
             0..=999 => 0,
             1000..=29_999 => 1,
             _ => 2,
@@ -75,7 +75,7 @@ impl<Task> Clone for MultiLevelQueue<Task> {
     fn clone(&self) -> Self {
         Self {
             injectors: self.injectors.clone(),
-            level_stats: self.level_stats.clone(),
+            level_elapsed: self.level_elapsed.clone(),
             task_elapsed_map: self.task_elapsed_map.clone(),
             level_ratio: self.level_ratio.clone(),
         }
@@ -110,7 +110,7 @@ impl<Task> GlobalQueue for MultiLevelQueue<Task> {
     }
 
     fn push(&self, mut task: SchedUnit<Self::Task>) {
-        let elapsed = task.task.elapsed.load(SeqCst);
+        let elapsed = task.task.elapsed.get();
         let level = task
             .task
             .fixed_level
@@ -144,11 +144,11 @@ impl LevelRatio {
 }
 
 #[derive(Clone, Default)]
-pub struct LevelStats(Arc<[AtomicU64; LEVEL_NUM]>);
+pub struct LevelElapsed(Arc<[AtomicU64; LEVEL_NUM]>);
 
-impl LevelStats {
-    pub fn inc_level_by(&self, level: u8, inc: u64) {
-        self.0[level as usize].fetch_add(inc, SeqCst);
+impl LevelElapsed {
+    pub fn inc_level_by(&self, level: u8, t: Duration) {
+        self.0[level as usize].fetch_add(t.as_micros() as u64, SeqCst);
     }
 }
 
@@ -194,11 +194,18 @@ where
         ctx: &mut PoolContext<Self::GlobalQueue>,
         task: <Self::GlobalQueue as GlobalQueue>::Task,
     ) -> bool {
+        let level = task.level;
+        let task_elapsed = task.elapsed.clone();
+
         let begin = Instant::now();
         let res = self.inner.handle(ctx, task);
         let duration = begin.elapsed();
-        // TODO: record duration
-        drop(duration);
+
+        task_elapsed.inc_by(duration);
+        ctx.global_queue()
+            .level_elapsed
+            .inc_level_by(level, duration);
+
         res
     }
 }

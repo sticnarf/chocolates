@@ -129,6 +129,10 @@ impl<G: GlobalQueue> PoolContext<G> {
         }
     }
 
+    pub fn global_queue(&self) -> &G {
+        &self.local_queue.core.global
+    }
+
     #[inline]
     fn deque_a_task(&mut self) -> (Steal<SchedUnit<G::Task>>, bool) {
         if let Some(e) = self.local_queue.local.pop() {
