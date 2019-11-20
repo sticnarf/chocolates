@@ -4,20 +4,27 @@ use crate::thread_pool::{GlobalQueue, PoolContext, SchedUnit};
 use stats::{TaskElapsed, TaskElapsedMap};
 
 use crossbeam_deque::{Injector, Steal};
+use futures_timer::Delay;
 use init_with::InitWith;
 use rand::prelude::*;
+use std::future::Future;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering::SeqCst};
+use std::sync::atomic::{
+    AtomicU32, AtomicU64, AtomicU8,
+    Ordering::{Relaxed, SeqCst},
+};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const LEVEL_NUM: usize = 3;
+const ADJUST_RATIO_INTERVAL: Duration = Duration::from_secs(1);
 
 pub struct MultiLevelQueue<Task, T = MultiLevelTask<Task>> {
-    injectors: Arc<[Injector<SchedUnit<T>>; LEVEL_NUM]>,
+    injectors: [Injector<SchedUnit<T>>; LEVEL_NUM],
     level_elapsed: LevelElapsed,
     task_elapsed_map: TaskElapsedMap,
-    level_ratio: LevelRatio,
+    level_chance_ratio: LevelChanceRatio,
+    target_ratio: TargetRatio,
     _phantom: PhantomData<Task>,
 }
 
@@ -41,12 +48,11 @@ impl<Task> AsRef<MultiLevelTask<Task>> for MultiLevelTask<Task> {
 impl<Task, T: AsRef<MultiLevelTask<Task>>> MultiLevelQueue<Task, T> {
     pub fn new() -> Self {
         Self {
-            injectors: Arc::new(<[Injector<SchedUnit<T>>; LEVEL_NUM]>::init_with(|| {
-                Injector::new()
-            })),
+            injectors: <[Injector<SchedUnit<T>>; LEVEL_NUM]>::init_with(|| Injector::new()),
             level_elapsed: LevelElapsed::default(),
             task_elapsed_map: TaskElapsedMap::new(),
-            level_ratio: LevelRatio::default(),
+            level_chance_ratio: LevelChanceRatio::default(),
+            target_ratio: TargetRatio::default(),
             _phantom: PhantomData,
         }
     }
@@ -74,17 +80,46 @@ impl<Task, T: AsRef<MultiLevelTask<Task>>> MultiLevelQueue<Task, T> {
             _ => 2,
         }
     }
-}
 
-impl<Task, T: AsRef<MultiLevelTask<Task>>> Clone for MultiLevelQueue<Task, T> {
-    fn clone(&self) -> Self {
-        Self {
-            injectors: self.injectors.clone(),
-            level_elapsed: self.level_elapsed.clone(),
-            task_elapsed_map: self.task_elapsed_map.clone(),
-            level_ratio: self.level_ratio.clone(),
-            _phantom: PhantomData,
+    pub fn target_ratio(&self) -> TargetRatio {
+        self.target_ratio.clone()
+    }
+
+    pub fn async_adjust_level_ratio(&self) -> impl Future<Output = ()> {
+        let level_elapsed = self.level_elapsed.clone();
+        let level_chance_ratio = self.level_chance_ratio.clone();
+        let target_ratio = self.target_ratio.clone();
+        async move {
+            let mut last_elapsed = level_elapsed.load_all();
+            loop {
+                Delay::new(ADJUST_RATIO_INTERVAL).await;
+                let curr_elapsed = level_elapsed.load_all();
+                let diff_elapsed = <[f32; LEVEL_NUM]>::init_with_indices(|i| {
+                    (curr_elapsed[i] - last_elapsed[i]) as f32
+                });
+                last_elapsed = curr_elapsed;
+
+                let sum: f32 = diff_elapsed.iter().sum();
+                if sum == 0.0 {
+                    continue;
+                }
+                let curr_l0_ratio = diff_elapsed[0] / sum;
+                let target_l0_ratio = target_ratio.get_l0_target();
+                if curr_l0_ratio > target_l0_ratio + 0.05 {
+                    let ratio01 = level_chance_ratio.0[0].load(SeqCst) as f32;
+                    let new_ratio01 = u32::min((ratio01 * 1.6).round() as u32, MAX_L0_CHANCE_RATIO);
+                    level_chance_ratio.0[0].store(new_ratio01, SeqCst);
+                } else if curr_l0_ratio < target_l0_ratio - 0.05 {
+                    let ratio01 = level_chance_ratio.0[0].load(SeqCst) as f32;
+                    let new_ratio01 = u32::max((ratio01 / 1.6).round() as u32, MIN_L0_CHANCE_RATIO);
+                    level_chance_ratio.0[0].store(new_ratio01, SeqCst);
+                }
+            }
         }
+    }
+
+    pub fn async_cleanup_stats(&self) -> impl Future<Output = ()> {
+        self.task_elapsed_map.async_cleanup()
     }
 }
 
@@ -95,7 +130,7 @@ impl<Task, T: AsRef<MultiLevelTask<Task>>> GlobalQueue for MultiLevelQueue<Task,
         &self,
         local_queue: &crossbeam_deque::Worker<SchedUnit<T>>,
     ) -> Steal<SchedUnit<T>> {
-        let level = self.level_ratio.rand_level();
+        let level = self.level_chance_ratio.rand_level();
         match self.injectors[level].steal_batch_and_pop(local_queue) {
             s @ Steal::Success(_) | s @ Steal::Retry => return s,
             _ => {}
@@ -104,7 +139,7 @@ impl<Task, T: AsRef<MultiLevelTask<Task>>> GlobalQueue for MultiLevelQueue<Task,
             .injectors
             .iter()
             .skip(level + 1)
-            .chain(&*self.injectors)
+            .chain(&self.injectors)
             .take(LEVEL_NUM)
         {
             match queue.steal_batch_and_pop(local_queue) {
@@ -115,7 +150,7 @@ impl<Task, T: AsRef<MultiLevelTask<Task>>> GlobalQueue for MultiLevelQueue<Task,
         Steal::Empty
     }
 
-    fn push(&self, mut task: SchedUnit<T>) {
+    fn push(&self, task: SchedUnit<T>) {
         let multi_level_task = task.task.as_ref();
         let elapsed = multi_level_task.elapsed.get();
         let level = multi_level_task
@@ -126,21 +161,24 @@ impl<Task, T: AsRef<MultiLevelTask<Task>>> GlobalQueue for MultiLevelQueue<Task,
     }
 }
 
-/// The i-th value represents the chance ratio of L_i and L_{i+1}.
-#[derive(Clone)]
-struct LevelRatio(Arc<[AtomicU32; LEVEL_NUM - 1]>);
+const MAX_L0_CHANCE_RATIO: u32 = 256;
+const MIN_L0_CHANCE_RATIO: u32 = 1;
 
-impl Default for LevelRatio {
+/// The i-th value represents the chance ratio of L_i and Sum[L_k] (k > i).
+#[derive(Clone)]
+struct LevelChanceRatio(Arc<[AtomicU32; LEVEL_NUM - 1]>);
+
+impl Default for LevelChanceRatio {
     fn default() -> Self {
         Self(Arc::new([AtomicU32::new(32), AtomicU32::new(4)]))
     }
 }
 
-impl LevelRatio {
+impl LevelChanceRatio {
     fn rand_level(&self) -> usize {
         let mut rng = thread_rng();
         for (level, ratio) in self.0.iter().enumerate() {
-            let ratio = ratio.load(SeqCst);
+            let ratio = ratio.load(Relaxed);
             if rng.gen_ratio(ratio, ratio.saturating_add(1)) {
                 return level;
             }
@@ -149,12 +187,37 @@ impl LevelRatio {
     }
 }
 
+/// The expected time percentage used by L0 tasks.
+#[derive(Clone)]
+pub struct TargetRatio(Arc<AtomicU8>);
+
+impl Default for TargetRatio {
+    fn default() -> Self {
+        Self(Arc::new(AtomicU8::new(80)))
+    }
+}
+
+impl TargetRatio {
+    pub fn set_l0_target(&self, ratio: f32) {
+        assert!(ratio >= 0.0 && ratio <= 1.0);
+        self.0.store((100.0 * ratio) as u8, Relaxed);
+    }
+
+    pub fn get_l0_target(&self) -> f32 {
+        self.0.load(Relaxed) as f32 / 100.0
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct LevelElapsed(Arc<[AtomicU64; LEVEL_NUM]>);
 
 impl LevelElapsed {
     pub fn inc_level_by(&self, level: u8, t: Duration) {
-        self.0[level as usize].fetch_add(t.as_micros() as u64, SeqCst);
+        self.0[level as usize].fetch_add(t.as_micros() as u64, Relaxed);
+    }
+
+    fn load_all(&self) -> [u64; LEVEL_NUM] {
+        <[u64; LEVEL_NUM]>::init_with_indices(|i| self.0[i].load(Relaxed))
     }
 }
 

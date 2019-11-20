@@ -383,4 +383,12 @@ impl MultiLevelThreadPool {
         );
         self.0.spawn(t);
     }
+
+    pub fn async_adjust_level_ratio(&self) -> impl std::future::Future<Output = ()> {
+        self.0.global_queue().async_adjust_level_ratio()
+    }
+
+    pub fn async_cleanup_stats(&self) -> impl std::future::Future<Output = ()> {
+        self.0.global_queue().async_cleanup_stats()
+    }
 }

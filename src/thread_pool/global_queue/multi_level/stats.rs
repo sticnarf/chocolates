@@ -54,8 +54,6 @@ impl TaskElapsedMap {
     }
 
     /// Creates a future which continuously cleans stale statistics.
-    ///
-    /// It needs tokio-timer to have been initialized.
     pub fn async_cleanup(&self) -> impl Future<Output = ()> {
         let new = self.new.clone();
         let old = self.old.clone();

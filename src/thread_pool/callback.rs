@@ -278,4 +278,12 @@ impl MultiLevelThreadPool {
         let task = global.create_task(Task::Mut(Box::new(t)), task_id, fixed_level);
         self.0.spawn(task);
     }
+
+    pub fn async_adjust_level_ratio(&self) -> impl std::future::Future<Output = ()> {
+        self.0.global_queue().0.async_adjust_level_ratio()
+    }
+
+    pub fn async_cleanup_stats(&self) -> impl std::future::Future<Output = ()> {
+        self.0.global_queue().0.async_cleanup_stats()
+    }
 }
