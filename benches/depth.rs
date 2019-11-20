@@ -100,21 +100,22 @@ mod thread_pool_callback {
 }
 
 mod thread_pool_future {
-    use chocolates::thread_pool::future::{RunnerFactory, Sender, TaskUnit};
-    use chocolates::thread_pool::{Config, GlobalQueue};
+    use chocolates::thread_pool::future::{Sender, SimpleThreadPool, TaskUnit};
+    use chocolates::thread_pool::{Config, SchedUnit};
     use criterion::Bencher;
     use futures::future;
     use std::sync::{mpsc, Arc};
 
     pub fn chained_spawn(b: &mut Bencher) {
-        let threadpool = Config::new("chained_spawn")
-            .max_idle_time(std::time::Duration::from_secs(3))
-            .spawn(RunnerFactory::new(4), || crossbeam_deque::Injector::new());
+        let mut config = Config::new("chained_spawn");
+        config.max_idle_time(std::time::Duration::from_secs(3));
+        let threadpool = SimpleThreadPool::from_config(config);
 
-        fn spawn<G>(pool_tx: Sender<G>, res_tx: mpsc::Sender<()>, n: usize)
-        where
-            G: GlobalQueue<Task = Arc<TaskUnit>> + Send + Sync + 'static,
-        {
+        fn spawn(
+            pool_tx: Sender<crossbeam_deque::Injector<SchedUnit<Arc<TaskUnit>>>>,
+            res_tx: mpsc::Sender<()>,
+            n: usize,
+        ) {
             if n == 0 {
                 res_tx.send(()).unwrap();
             } else {

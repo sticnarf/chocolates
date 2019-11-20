@@ -6,43 +6,48 @@ use stats::{TaskElapsed, TaskElapsedMap};
 use crossbeam_deque::{Injector, Steal};
 use init_with::InitWith;
 use rand::prelude::*;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::SeqCst};
+use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering::SeqCst};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const LEVEL_NUM: usize = 3;
 
-pub struct MultiLevelQueue<Task> {
-    injectors: Arc<[Injector<SchedUnit<MultiLevelTask<Task>>>; LEVEL_NUM]>,
+pub struct MultiLevelQueue<Task, T = MultiLevelTask<Task>> {
+    injectors: Arc<[Injector<SchedUnit<T>>; LEVEL_NUM]>,
     level_elapsed: LevelElapsed,
     task_elapsed_map: TaskElapsedMap,
     level_ratio: LevelRatio,
+    _phantom: PhantomData<Task>,
 }
 
+unsafe impl<Task, T: Send> Send for MultiLevelQueue<Task, T> {}
+
+unsafe impl<Task, T: Send> Sync for MultiLevelQueue<Task, T> {}
+
 pub struct MultiLevelTask<Task> {
-    task: Task,
+    pub(crate) task: Task,
     elapsed: TaskElapsed,
-    level: u8,
+    level: AtomicU8,
     fixed_level: Option<u8>,
 }
 
-impl<Task> AsMut<Task> for MultiLevelTask<Task> {
-    fn as_mut(&mut self) -> &mut Task {
-        &mut self.task
+impl<Task> AsRef<MultiLevelTask<Task>> for MultiLevelTask<Task> {
+    fn as_ref(&self) -> &MultiLevelTask<Task> {
+        self
     }
 }
 
-impl<Task> MultiLevelQueue<Task> {
+impl<Task, T: AsRef<MultiLevelTask<Task>>> MultiLevelQueue<Task, T> {
     pub fn new() -> Self {
         Self {
-            injectors: Arc::new(
-                <[Injector<SchedUnit<MultiLevelTask<Task>>>; LEVEL_NUM]>::init_with(|| {
-                    Injector::new()
-                }),
-            ),
+            injectors: Arc::new(<[Injector<SchedUnit<T>>; LEVEL_NUM]>::init_with(|| {
+                Injector::new()
+            })),
             level_elapsed: LevelElapsed::default(),
             task_elapsed_map: TaskElapsedMap::new(),
             level_ratio: LevelRatio::default(),
+            _phantom: PhantomData,
         }
     }
 
@@ -57,7 +62,7 @@ impl<Task> MultiLevelQueue<Task> {
         MultiLevelTask {
             task,
             elapsed,
-            level,
+            level: AtomicU8::new(level),
             fixed_level,
         }
     }
@@ -71,24 +76,25 @@ impl<Task> MultiLevelQueue<Task> {
     }
 }
 
-impl<Task> Clone for MultiLevelQueue<Task> {
+impl<Task, T: AsRef<MultiLevelTask<Task>>> Clone for MultiLevelQueue<Task, T> {
     fn clone(&self) -> Self {
         Self {
             injectors: self.injectors.clone(),
             level_elapsed: self.level_elapsed.clone(),
             task_elapsed_map: self.task_elapsed_map.clone(),
             level_ratio: self.level_ratio.clone(),
+            _phantom: PhantomData,
         }
     }
 }
 
-impl<Task> GlobalQueue for MultiLevelQueue<Task> {
-    type Task = MultiLevelTask<Task>;
+impl<Task, T: AsRef<MultiLevelTask<Task>>> GlobalQueue for MultiLevelQueue<Task, T> {
+    type Task = T;
 
     fn steal_batch_and_pop(
         &self,
-        local_queue: &crossbeam_deque::Worker<SchedUnit<Self::Task>>,
-    ) -> Steal<SchedUnit<Self::Task>> {
+        local_queue: &crossbeam_deque::Worker<SchedUnit<T>>,
+    ) -> Steal<SchedUnit<T>> {
         let level = self.level_ratio.rand_level();
         match self.injectors[level].steal_batch_and_pop(local_queue) {
             s @ Steal::Success(_) | s @ Steal::Retry => return s,
@@ -109,13 +115,13 @@ impl<Task> GlobalQueue for MultiLevelQueue<Task> {
         Steal::Empty
     }
 
-    fn push(&self, mut task: SchedUnit<Self::Task>) {
-        let elapsed = task.task.elapsed.get();
-        let level = task
-            .task
+    fn push(&self, mut task: SchedUnit<T>) {
+        let multi_level_task = task.task.as_ref();
+        let elapsed = multi_level_task.elapsed.get();
+        let level = multi_level_task
             .fixed_level
             .unwrap_or_else(|| self.expected_level(elapsed));
-        task.task.level = level;
+        multi_level_task.level.store(level, SeqCst);
         self.injectors[level as usize].push(task);
     }
 }
@@ -152,22 +158,24 @@ impl LevelElapsed {
     }
 }
 
-pub struct RunnerFactory<R, Task>
+pub struct RunnerFactory<R, Task, T>
 where
     R: super::super::RunnerFactory,
     <R as super::super::RunnerFactory>::Runner:
-        super::super::Runner<GlobalQueue = MultiLevelQueue<Task>>,
+        super::super::Runner<GlobalQueue = MultiLevelQueue<Task, T>>,
+    T: AsRef<MultiLevelTask<Task>>,
 {
     inner: R,
 }
 
-impl<R, Task> super::super::RunnerFactory for RunnerFactory<R, Task>
+impl<R, Task, T> super::super::RunnerFactory for RunnerFactory<R, Task, T>
 where
     R: super::super::RunnerFactory,
     <R as super::super::RunnerFactory>::Runner:
-        super::super::Runner<GlobalQueue = MultiLevelQueue<Task>>,
+        super::super::Runner<GlobalQueue = MultiLevelQueue<Task, T>>,
+    T: AsRef<MultiLevelTask<Task>>,
 {
-    type Runner = Runner<<R as super::super::RunnerFactory>::Runner, Task>;
+    type Runner = Runner<<R as super::super::RunnerFactory>::Runner, Task, T>;
 
     fn produce(&mut self) -> Self::Runner {
         Runner {
@@ -176,26 +184,25 @@ where
     }
 }
 
-pub struct Runner<R, Task>
+pub struct Runner<R, Task, T>
 where
-    R: super::super::Runner<GlobalQueue = MultiLevelQueue<Task>>,
+    R: super::super::Runner<GlobalQueue = MultiLevelQueue<Task, T>>,
+    T: AsRef<MultiLevelTask<Task>>,
 {
     inner: R,
 }
 
-impl<R, Task> super::super::Runner for Runner<R, Task>
+impl<R, Task, T> super::super::Runner for Runner<R, Task, T>
 where
-    R: super::super::Runner<GlobalQueue = MultiLevelQueue<Task>>,
+    R: super::super::Runner<GlobalQueue = MultiLevelQueue<Task, T>>,
+    T: AsRef<MultiLevelTask<Task>>,
 {
-    type GlobalQueue = MultiLevelQueue<Task>;
+    type GlobalQueue = MultiLevelQueue<Task, T>;
 
-    fn handle(
-        &mut self,
-        ctx: &mut PoolContext<Self::GlobalQueue>,
-        task: <Self::GlobalQueue as GlobalQueue>::Task,
-    ) -> bool {
-        let level = task.level;
-        let task_elapsed = task.elapsed.clone();
+    fn handle(&mut self, ctx: &mut PoolContext<Self::GlobalQueue>, task: T) -> bool {
+        let multi_level_task = task.as_ref();
+        let level = multi_level_task.level.load(SeqCst);
+        let task_elapsed = multi_level_task.elapsed.clone();
 
         let begin = Instant::now();
         let res = self.inner.handle(ctx, task);

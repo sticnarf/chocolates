@@ -6,15 +6,28 @@ pub enum Task<G>
 where
     G: GlobalQueue,
 {
-    Once(Option<Box<dyn FnOnce(&mut Handle<'_, G>) + Send>>),
+    Once(Box<dyn FnOnce(&mut Handle<'_, G>) + Send>),
     Mut(Box<dyn FnMut(&mut Handle<'_, G>) + Send>),
 }
 
-impl<G> AsMut<Self> for Task<G>
+pub trait CallbackTask<G>: Sized
 where
-    G: GlobalQueue,
+    G: GlobalQueue<Task = Self>,
 {
-    fn as_mut(&mut self) -> &mut Self {
+    fn as_mut_task(&mut self) -> &mut Task<G>;
+
+    fn into_task(self) -> Task<G>;
+}
+
+impl<G> CallbackTask<G> for Task<G>
+where
+    G: GlobalQueue<Task = Self>,
+{
+    fn as_mut_task(&mut self) -> &mut Task<G> {
+        self
+    }
+
+    fn into_task(self) -> Task<G> {
         self
     }
 }
@@ -30,13 +43,13 @@ where
 impl<G, T> super::Runner for Runner<G>
 where
     G: GlobalQueue<Task = T>,
-    T: AsMut<Task<G>>,
+    T: CallbackTask<G>,
 {
     type GlobalQueue = G;
 
     fn handle(&mut self, ctx: &mut PoolContext<G>, mut task: G::Task) -> bool {
         let mut handle = Handle { ctx, rerun: false };
-        match task.as_mut() {
+        match task.as_mut_task() {
             Task::Mut(ref mut r) => {
                 let mut tried_times = 0;
                 loop {
@@ -52,9 +65,12 @@ where
                     }
                 }
             }
-            Task::Once(ref mut r) => {
-                (r.take().unwrap())(&mut handle);
-                return true;
+            Task::Once(_) => {
+                if let Task::Once(r) = task.into_task() {
+                    r(&mut handle);
+                    return true;
+                }
+                unreachable!()
             }
         }
         ctx.spawn(task);
@@ -90,7 +106,7 @@ where
     G: GlobalQueue<Task = Task<G>>,
 {
     pub fn spawn_once(&mut self, t: impl FnOnce(&mut Handle<'_, G>) + Send + 'static) {
-        self.ctx.spawn(Task::Once(Some(Box::new(t))));
+        self.ctx.spawn(Task::Once(Box::new(t)));
     }
 
     pub fn spawn_mut(&mut self, t: impl FnMut(&mut Handle<'_, G>) + Send + 'static) {
@@ -110,7 +126,7 @@ where
     G: GlobalQueue<Task = Task<G>>,
 {
     pub fn spawn_once(&self, t: impl FnOnce(&mut Handle<'_, G>) + Send + 'static) {
-        self.remote.spawn(Task::Once(Some(Box::new(t))));
+        self.remote.spawn(Task::Once(Box::new(t)));
     }
 
     pub fn spawn_mut(&self, t: impl FnMut(&mut Handle<'_, G>) + Send + 'static) {
@@ -145,7 +161,7 @@ where
 impl<G, T> super::RunnerFactory for RunnerFactory<G>
 where
     G: GlobalQueue<Task = T>,
-    T: AsMut<Task<G>>,
+    T: CallbackTask<G>,
 {
     type Runner = Runner<G>;
 
@@ -188,7 +204,7 @@ impl SimpleThreadPool {
     }
 
     pub fn spawn_once(&self, t: impl FnOnce(&mut Handle<'_, SingleQueue>) + Send + 'static) {
-        self.0.spawn(Task::Once(Some(Box::new(t))))
+        self.0.spawn(Task::Once(Box::new(t)))
     }
 
     pub fn spawn_mut(&self, t: impl FnMut(&mut Handle<'_, SingleQueue>) + Send + 'static) {
@@ -218,6 +234,19 @@ impl GlobalQueue for MultiLevelQueue {
     }
 }
 
+impl<G> CallbackTask<G> for multi_level::MultiLevelTask<Task<G>>
+where
+    G: GlobalQueue<Task = Self>,
+{
+    fn as_mut_task(&mut self) -> &mut Task<G> {
+        &mut self.task
+    }
+
+    fn into_task(self) -> Task<G> {
+        self.task
+    }
+}
+
 pub struct MultiLevelThreadPool(super::ThreadPool<MultiLevelQueue>);
 
 impl MultiLevelThreadPool {
@@ -235,7 +264,7 @@ impl MultiLevelThreadPool {
         fixed_level: Option<u8>,
     ) {
         let global = &self.0.global_queue().0;
-        let task = global.create_task(Task::Once(Some(Box::new(t))), task_id, fixed_level);
+        let task = global.create_task(Task::Once(Box::new(t)), task_id, fixed_level);
         self.0.spawn(task)
     }
 
