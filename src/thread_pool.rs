@@ -1,6 +1,7 @@
 pub mod callback;
 pub mod future;
 pub mod global_queue;
+pub mod std_future;
 
 use crossbeam_deque::Steal;
 use parking_lot_core::{FilterOp, ParkResult, ParkToken, UnparkToken};

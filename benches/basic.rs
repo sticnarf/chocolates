@@ -288,6 +288,74 @@ mod thread_pool_future {
     }
 }
 
+mod thread_pool_std_future {
+    use chocolates::thread_pool::std_future::SimpleThreadPool;
+    use chocolates::thread_pool::Config;
+    use futures03::prelude::*;
+    use num_cpus;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering::SeqCst;
+    use std::sync::{mpsc, Arc};
+    use std::task::Poll;
+
+    pub fn spawn_many(b: &mut criterion::Bencher) {
+        let threadpool = SimpleThreadPool::from_config(Config::new("test-pool"));
+
+        let (tx, rx) = mpsc::sync_channel(10);
+        let rem = Arc::new(AtomicUsize::new(0));
+
+        b.iter(move || {
+            rem.store(super::NUM_SPAWN, SeqCst);
+
+            for _ in 0..super::NUM_SPAWN {
+                let tx = tx.clone();
+                let rem = rem.clone();
+
+                threadpool.spawn_future(async move {
+                    if 1 == rem.fetch_sub(1, SeqCst) {
+                        tx.send(()).unwrap();
+                    }
+                });
+            }
+
+            let _ = rx.recv().unwrap();
+        });
+    }
+
+    pub fn yield_many(b: &mut criterion::Bencher) {
+        let threadpool = SimpleThreadPool::from_config(Config::new("test-pool"));
+        let tasks = super::TASKS_PER_CPU * num_cpus::get();
+
+        let (tx, rx) = mpsc::sync_channel(tasks);
+
+        b.iter(move || {
+            for _ in 0..tasks {
+                let mut rem = super::NUM_YIELD;
+                let tx = tx.clone();
+
+                threadpool.spawn_future(future::poll_fn(move |cx| {
+                    rem -= 1;
+
+                    if rem == 0 {
+                        tx.send(()).unwrap();
+                        Poll::Ready(())
+                    } else {
+                        // Notify the current task
+                        cx.waker().wake_by_ref();
+
+                        // Not ready
+                        Poll::Pending
+                    }
+                }));
+            }
+
+            for _ in 0..tasks {
+                let _ = rx.recv().unwrap();
+            }
+        });
+    }
+}
+
 mod multi_level_pool_callback {
     use chocolates::thread_pool::callback::{CallbackTask, Handle, MultiLevelThreadPool};
     use chocolates::thread_pool::{Config, GlobalQueue};
@@ -443,6 +511,9 @@ fn spawn_many(b: &mut Criterion) {
             |b, _| thread_pool_future::spawn_many(b),
             &[()],
         )
+        .with_function("thread_pool_std_future", |b, _| {
+            thread_pool_std_future::spawn_many(b)
+        })
         .with_function("thread_pool_callback", |b, _| {
             thread_pool_callback::spawn_many(b)
         })
@@ -465,6 +536,9 @@ fn yield_many(b: &mut Criterion) {
             |b, _| thread_pool_future::yield_many(b),
             &[()],
         )
+        .with_function("thread_pool_std_future", |b, _| {
+            thread_pool_std_future::yield_many(b)
+        })
         .with_function("thread_pool_callback", |b, _| {
             thread_pool_callback::yield_many(b)
         })
